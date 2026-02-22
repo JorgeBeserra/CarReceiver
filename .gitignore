@@ -1,0 +1,16 @@
+# Python/Node environments and common ignores
+__pycache__/
+*.pyc
+.env/
+venv/
+*.log
+node_modules/
+dist/
+*.egg-info/
+.DS_Store
+*.sqlite3
+*.tar.gz
+*.zip
+*.tar
+*.gz
+*.tgz

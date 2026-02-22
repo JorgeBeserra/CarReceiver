@@ -1,0 +1,20 @@
+name: CI
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+    - name: Set up PlatformIO
+      uses: platformio/setup-ide@v1
+    - name: Build firmware
+      run: platformio run -e esp32dev
+    - name: Upload arterial artifacts
+      if: success()
+      run: |
+        echo "Artifacts would be uploaded here (firmware binaries)"
