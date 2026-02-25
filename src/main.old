@@ -136,7 +136,6 @@ void setup() {
   ledcAttachPin(enableRightMotor, rightMotorPWMSpeedChannel);
   ledcAttachPin(enableLeftMotor, leftMotorPWMSpeedChannel);
 
-  BP32.begin("CarReceiver ESP32");
   BP32.setup(&onConnectedController, &onDisconnectedController);
   BP32.forgetBluetoothKeys();
   BP32.enableVirtualDevice(false);

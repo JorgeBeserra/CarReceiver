@@ -6,14 +6,26 @@
 #define FIRMWARE_VERSION "1.0.0"
 
 // 🟦 Pinos
+// Controle
+// Quando o Stiek da esquerda ficar no neutro tem que parar os motores e tem que acender as luzes do stop durante 
+// Quando o Stick do lado esquerdo for para tras tem que acender a luz de ré
+// Botao X -> Buzina
+// Botao Quadrado -> Farol Baixo e Farol Alto
+// Botao triangulo -> Pisca Alerta
+// R1 -> Pisca Direita
+// L1 -> Pisca Esquerda
+// R2 -> Acelerador
+// L2 -> Freio tem que acender as luzes de Freio e tem que parar os motores
 
-// Pinos da ponte H
-const int ENA = 14;  // PWM pin for motor A - Marrom
-const int IN1 = 13;  // Motor esquerdo - Azul
-const int IN2 = 12;  // Vermelho
-const int IN3 = 27;  // Motor direito - Verde
-const int IN4 = 32;  // Laranja
-const int ENB = 26;  // PWM pin for motor B - Amarelo
+
+
+// Pinos
+const int enableRightMotor = 14; // PWM pin for motor A - Marrom
+const int rightMotorPin1 = 13; // Motor esquerdo - Azul
+const int rightMotorPin2 = 12; // Vermelho
+const int leftMotorPin1 = 27;// Motor direito - Verde
+const int leftMotorPin2 = 32;// Laranja
+const int enableLeftMotor = 26;// PWM pin for motor B - Amarelo
 
 // Pinos dos Leds
 const int FAROL = 15;  // PWM pin for motor B
@@ -22,12 +34,44 @@ const int FREIO = 4;  // PWM pin for motor B
 const int SETA_DIREITA = 16;  // PWM pin for motor B
 const int SETA_ESQUERDA = 17;  // PWM pin for motor B
 
+const int PWMFreq = 1000;
+const int PWMResolution = 8;
+const int rightMotorPWMSpeedChannel = 4;
+const int leftMotorPWMSpeedChannel = 5;
+
+int motorDirection = 1;
 int speed1;
 int speed2;
 int direction1;
 int direction2;
 
 ControllerPtr myControllers[BP32_MAX_GAMEPADS];
+
+// Helpers
+void rotateMotor(int rightMotorSpeed, int leftMotorSpeed) {
+  if (rightMotorSpeed < 0) {
+    digitalWrite(rightMotorPin1,LOW);
+    digitalWrite(rightMotorPin2,HIGH);
+  } else if (rightMotorSpeed > 0) {
+    digitalWrite(rightMotorPin1,HIGH);
+    digitalWrite(rightMotorPin2,LOW);
+  } else {
+    digitalWrite(rightMotorPin1,LOW);
+    digitalWrite(rightMotorPin2,LOW);
+  }
+  if (leftMotorSpeed < 0) {
+    digitalWrite(leftMotorPin1,LOW);
+    digitalWrite(leftMotorPin2,HIGH);
+  } else if (leftMotorSpeed > 0) {
+    digitalWrite(leftMotorPin1,HIGH);
+    digitalWrite(leftMotorPin2,LOW);
+  } else {
+    digitalWrite(leftMotorPin1,LOW);
+    digitalWrite(leftMotorPin2,LOW);
+  }
+  ledcWrite(rightMotorPWMSpeedChannel, abs(rightMotorSpeed));
+  ledcWrite(leftMotorPWMSpeedChannel, abs(leftMotorSpeed));
+}
 
 // This callback gets called any time a new gamepad is connected.
 // Up to 4 gamepads can be connected at the same time.
@@ -152,52 +196,20 @@ void dumpBalanceBoard(ControllerPtr ctl) {
     );
 }
 
-void moveMotores(int velocidadeX, int direcaoY) {
-  int velocidadeEsquerda = velocidadeX;
-  int velocidadeDireita = velocidadeX;
-
-  // Ajuste para virar (gira no próprio eixo com valores de Y)
-  velocidadeEsquerda -= direcaoY;
-  velocidadeDireita += direcaoY;
-
-  // Limita os valores entre -100 e 100
-  velocidadeEsquerda = constrain(velocidadeEsquerda, -100, 100);
-  velocidadeDireita = constrain(velocidadeDireita, -100, 100);
-
-    // ZONA MORTA
-  if (abs(velocidadeEsquerda) < 15 && abs(velocidadeDireita) < 15) {
-    analogWrite(ENA, 0);
-    analogWrite(ENB, 0);
-    // Freio ativo: coloca IN1 e IN2 HIGH para frear motor esquerdo
-    digitalWrite(IN1, HIGH);
-    digitalWrite(IN2, HIGH);
-    // Freio ativo: coloca IN3 e IN4 HIGH para frear motor direito
-    digitalWrite(IN3, HIGH);
-    digitalWrite(IN4, HIGH);
-    return;
-  }
-
-  // Aplica os valores para o motor esquerdo
-  if (velocidadeEsquerda >= 0) {
-    analogWrite(ENA, map(abs(velocidadeEsquerda), 0, 100, 0, 1023));
-    digitalWrite(IN1, LOW);
-    digitalWrite(IN2, HIGH);
-  } else {
-    analogWrite(ENA, map(abs(velocidadeEsquerda), 0, 100, 0, 1023));
-    digitalWrite(IN1, HIGH);
-    digitalWrite(IN2, LOW);
-  }
-
-  // Aplica os valores para o motor direito
-  if (velocidadeDireita >= 0) {
-    analogWrite(ENB, map(abs(velocidadeDireita), 0, 100, 0, 1023));
-    digitalWrite(IN3, LOW);
-    digitalWrite(IN4, HIGH);
-  } else {
-    analogWrite(ENB, map(abs(velocidadeDireita), 0, 100, 0, 1023));
-    digitalWrite(IN3, HIGH);
-    digitalWrite(IN4, LOW);
-  }
+int moveMotores(int sentidoX, int steeringY, int throttleR2) {
+  int sentido = map(sentidoX, -127, 127, -255, 255);
+  int steer = map(steeringY, -127, 127, -255, 255);
+  // Mapeia throttle (0-1023) para fator de velocidade (10% a 100%)
+  float throttle = constrain(throttleR2, 0, 1023);
+  float factor = 0.1f + (throttle / 1023.0f) * 0.9f; // 0.1 a 1.0
+  int rightSpeed = (int)((abs(sentido) - steer) * factor);
+  int leftSpeed = (int)((abs(sentido) + steer) * factor);
+  rightSpeed = constrain(rightSpeed, 0, 255);
+  leftSpeed = constrain(leftSpeed, 0, 255);
+  int rDir = (sentido < 0) ? -1 : 1;
+  int lDir = (sentido < 0) ? -1 : 1;
+  rotateMotor(rightSpeed * rDir, leftSpeed * lDir);
+  return 0;
 }
 
 void processGamepad(ControllerPtr ctl) {
@@ -245,7 +257,7 @@ void processGamepad(ControllerPtr ctl) {
                             0x40 /* strongMagnitude */);
     }  
 
-    moveMotores( ctl->axisY() , ctl->axisX() );
+    moveMotores( ctl->axisY() , ctl->axisRX(), ctl->throttle() );
 
     // Another way to query controller data is by getting the buttons() function.
     // See how the different "dump*" functions dump the Controller info.
@@ -324,14 +336,17 @@ void processControllers() {
 void setup() {
     Serial.begin(115200);
     Serial.printf("Firmware: %s\n", BP32.firmwareVersion());
+    const uint8_t* addr = BP32.localBdAddress();
+    Serial.printf("BD Addr: %2X:%2X:%2X:%2X:%2X:%2X\n", addr[0], addr[1], addr[2], addr[3], addr[4], addr[5]);
+    BP32.setup(&onConnectedController, &onDisconnectedController);    
 
     // Configura os pinos da ponte H
-    pinMode(ENA, OUTPUT);
-    pinMode(ENB, OUTPUT);
-    pinMode(IN1, OUTPUT);
-    pinMode(IN2, OUTPUT);
-    pinMode(IN3, OUTPUT);
-    pinMode(IN4, OUTPUT);
+    pinMode(enableRightMotor, OUTPUT);
+    pinMode(enableLeftMotor, OUTPUT);
+    pinMode(rightMotorPin1, OUTPUT);
+    pinMode(rightMotorPin2, OUTPUT);
+    pinMode(leftMotorPin1, OUTPUT);
+    pinMode(leftMotorPin2, OUTPUT);
 
     // Configura os pinos dos Leds
     pinMode(FAROL, OUTPUT);
@@ -340,24 +355,18 @@ void setup() {
     pinMode(SETA_DIREITA, OUTPUT);
     pinMode(SETA_ESQUERDA, OUTPUT);
 
-    const uint8_t* addr = BP32.localBdAddress();
-    Serial.printf("BD Addr: %2X:%2X:%2X:%2X:%2X:%2X\n", addr[0], addr[1], addr[2], addr[3], addr[4], addr[5]);
+    pinMode(FAROL, OUTPUT);
+    pinMode(RE, OUTPUT);
+    pinMode(FREIO, OUTPUT);
+    pinMode(SETA_DIREITA, OUTPUT);
+    pinMode(SETA_ESQUERDA, OUTPUT);
 
-    // Setup the Bluepad32 callbacks
-    BP32.setup(&onConnectedController, &onDisconnectedController);
+    ledcSetup(rightMotorPWMSpeedChannel, PWMFreq, PWMResolution);
+    ledcSetup(leftMotorPWMSpeedChannel, PWMFreq, PWMResolution);
+    ledcAttachPin(enableRightMotor, rightMotorPWMSpeedChannel);
+    ledcAttachPin(enableLeftMotor, leftMotorPWMSpeedChannel);
 
-    // "forgetBluetoothKeys()" should be called when the user performs
-    // a "device factory reset", or similar.
-    // Calling "forgetBluetoothKeys" in setup() just as an example.
-    // Forgetting Bluetooth keys prevents "paired" gamepads to reconnect.
-    // But it might also fix some connection / re-connection issues.
-    BP32.forgetBluetoothKeys();
-
-    // Enables mouse / touchpad support for gamepads that support them.
-    // When enabled, controllers like DualSense and DualShock4 generate two connected devices:
-    // - First one: the gamepad
-    // - Second one, which is a "virtual device", is a mouse.
-    // By default, it is disabled.
+    BP32.forgetBluetoothKeys();    
     BP32.enableVirtualDevice(false);
 }
 
@@ -368,12 +377,6 @@ void loop() {
     bool dataUpdated = BP32.update();
     if (dataUpdated)
         processControllers();
-
-    // The main loop must have some kind of "yield to lower priority task" event.
-    // Otherwise, the watchdog will get triggered.
-    // If your main loop doesn't have one, just add a simple `vTaskDelay(1)`.
-    // Detailed info here:
-    // https://stackoverflow.com/questions/66278271/task-watchdog-got-triggered-the-tasks-did-not-reset-the-watchdog-in-time
 
     // vTaskDelay(1);
     delay(150);
