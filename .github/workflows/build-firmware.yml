@@ -29,7 +29,7 @@ jobs:
           arduino-cli core update-index
           # Instala o core oficial + o Bluepad32 embutido (versão mais recente, compatível com 3.x)
           arduino-cli core install esp32:esp32    # <-- este é o segredo!
-          #arduino-cli core install esp32:esp32_bluepad32    # <-- este é o segredo!
+          arduino-cli core install esp32-bluepad32:esp32
       
       - name: Debug Show installed cores and boards
         run: |
@@ -37,15 +37,6 @@ jobs:
           arduino-cli board listall | grep -i esp32 || echo "Nenhum board ESP32 listado"
           arduino-cli board listall | grep -i bluepad || echo "Bluepad não apareceu"
           
-      - name: Install Bluepad32 library
-        run: |
-          arduino-cli config set library.enable_unsafe_install true
-          # Baixa o repositório como ZIP
-          wget https://github.com/ricardoquesada/bluepad32/archive/refs/heads/main.zip -O bluepad32.zip
-          # Instala a partir do ZIP
-          arduino-cli lib install --zip-path bluepad32.zip
-          arduino-cli lib list | grep -i bluepad
-
       - name: Show environment (debug)
         run: |
           arduino-cli core list
