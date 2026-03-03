@@ -28,8 +28,14 @@ jobs:
           arduino-cli config add board_manager.additional_urls https://raw.githubusercontent.com/ricardoquesada/esp32-arduino-lib-builder/master/bluepad32_files/package_esp32_bluepad32_index.json
           arduino-cli core update-index
           # Instala o core oficial + o Bluepad32 embutido (versão mais recente, compatível com 3.x)
-          arduino-cli core install esp32:esp32
-          arduino-cli core install esp32:bluepad32    # <-- este é o segredo!
+          arduino-cli core install esp32:esp32@3.0.0
+          arduino-cli core install esp32:esp32-bluepad32    # <-- este é o segredo!
+      
+      - name: Debug Show installed cores and boards
+        run: |
+          arduino-cli core list
+          arduino-cli board listall | grep -i esp32 || echo "Nenhum board ESP32 listado"
+          arduino-cli board listall | grep -i bluepad || echo "Bluepad não apareceu"
 
       - name: Show environment (debug)
         run: |
