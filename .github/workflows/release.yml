@@ -1,0 +1,89 @@
+name: Build firmware (CarReceiver ESP32)
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - 'CarReceiver.ino'
+      - '.github/workflows/build-firmware.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Arduino CLI
+        uses: arduino/setup-arduino-cli@v2
+
+      - name: Install ESP32 core
+        run: |
+          arduino-cli config init
+          arduino-cli config add board_manager.additional_urls https://raw.githubusercontent.com/espressif/arduino-esp32/gh-pages/package_esp32_index.json
+          arduino-cli core update-index
+          arduino-cli core install esp32:esp32
+
+      - name: Extract firmware version
+        id: version
+        run: |
+          VERSION=$(grep -Po '(?<=#define FIRMWARE_VERSION ")[^"]*' CarReceiver.ino | head -n 1)
+          if [ -z "$VERSION" ]; then
+            echo "ERRO: não achei #define FIRMWARE_VERSION em CarReceiver.ino"
+            exit 1
+          fi
+          echo "Firmware version: $VERSION"
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+
+      # Bluepad32 às vezes não está no arduino-cli lib index.
+      # Então puxamos direto do GitHub e colocamos em ./libraries
+      - name: Install Bluepad32 library (from GitHub)
+        run: |
+          mkdir -p libraries
+          rm -rf libraries/Bluepad32
+          git clone --depth 1 https://github.com/ricardoquesada/bluepad32-arduino.git libraries/Bluepad32
+
+      - name: Create Git Tag (if needed)
+        run: |
+          git config user.name "github-actions"
+          git config user.email "github-actions@github.com"
+          git fetch --tags
+
+          TAG="v${{ steps.version.outputs.version }}"
+          if git rev-parse "$TAG" >/dev/null 2>&1; then
+            echo "Tag $TAG já existe. OK."
+          else
+            git tag -a "$TAG" -m "Release $TAG"
+            git push origin "$TAG"
+          fi
+
+      - name: Compile firmware
+        run: |
+          # Ajuste a board aqui se precisar (FQBN)
+          # Exemplo comum: esp32:esp32:esp32
+          arduino-cli compile \
+            --fqbn esp32:esp32:esp32 \
+            --export-binaries \
+            --output-dir build \
+            .
+
+          # Normalmente gera um .bin com nome do sketch.
+          # Padroniza para CarReceiver.bin
+          BIN=$(ls -1 build/*.bin | head -n 1)
+          echo "BIN gerado: $BIN"
+          cp "$BIN" build/CarReceiver.bin
+
+      - name: Create/Update GitHub Release and upload asset
+        uses: softprops/action-gh-release@v2
+        with:
+          name: "Firmware v${{ steps.version.outputs.version }}"
+          tag_name: "v${{ steps.version.outputs.version }}"
+          files: build/CarReceiver.bin
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
