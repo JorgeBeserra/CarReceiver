@@ -48,6 +48,9 @@ jobs:
           mkdir -p libraries
           rm -rf libraries/Bluepad32
           git clone --depth 1 https://github.com/ricardoquesada/bluepad32-arduino.git libraries/Bluepad32
+          echo "== Conteudo da lib =="
+          ls -la libraries/Bluepad32
+          find libraries/Bluepad32 -maxdepth 3 -type f -name "Bluepad32.h" -print
 
       - name: Create Git Tag (if needed)
         run: |
@@ -69,6 +72,7 @@ jobs:
           # Exemplo comum: esp32:esp32:esp32
           arduino-cli compile \
             --fqbn esp32:esp32:esp32 \
+            --libraries "$GITHUB_WORKSPACE/libraries"
             --export-binaries \
             --output-dir build \
             .
