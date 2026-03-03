@@ -558,6 +558,7 @@ static bool githubGetLatest(String& outVersion, String& outBinUrl) {
   return true;
 }
 
+
 const char* WIFI_SSID = "";
 const char* WIFI_PASS = "";
 
