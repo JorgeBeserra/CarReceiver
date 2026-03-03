@@ -1,9 +1,8 @@
-name: Build firmware (CarReceiver ESP32)
+name: Build firmware (CarReceiver ESP32 + Bluepad32)
 
 on:
   push:
-    branches:
-      - main
+    branches: [ main ]
     paths:
       - 'CarReceiver.ino'
       - '.github/workflows/build-firmware.yml'
@@ -17,18 +16,25 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      - name: Checkout code
+      - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Set up Arduino CLI
+      - name: Setup Arduino CLI
         uses: arduino/setup-arduino-cli@v2
 
-      - name: Install ESP32 core
+      - name: Install ESP32 + Bluepad32 cores
         run: |
           arduino-cli config init
+
+          # URLs oficiais (ESP32) + Bluepad32 (ESP32+Bluepad32)
+          arduino-cli config add board_manager.additional_urls https://raw.githubusercontent.com/espressif/arduino-esp32/gh-pages/package_esp32_index.json
           arduino-cli config add board_manager.additional_urls https://raw.githubusercontent.com/ricardoquesada/esp32-arduino-lib-builder/master/bluepad32_files/package_esp32_bluepad32_index.json
+
           arduino-cli core update-index
+
+          # Instala os dois pacotes (o Bluepad32 depende do ESP32)
           arduino-cli core install esp32:esp32
+          arduino-cli core install esp32_bluepad32:esp32
 
       - name: Extract firmware version
         id: version
@@ -38,19 +44,26 @@ jobs:
             echo "ERRO: não achei #define FIRMWARE_VERSION em CarReceiver.ino"
             exit 1
           fi
-          echo "Firmware version: $VERSION"
           echo "version=$VERSION" >> $GITHUB_OUTPUT
+          echo "Firmware version: $VERSION"
 
-      # Bluepad32 às vezes não está no arduino-cli lib index.
-      # Então puxamos direto do GitHub e colocamos em ./libraries
-      - name: Install Bluepad32 library (from GitHub)
+      - name: Pick FQBN (ESP32 Dev Module - Bluepad32)
+        id: fqbn
         run: |
-          mkdir -p libraries
-          rm -rf libraries/Bluepad32
-          git clone --depth 1 https://github.com/ricardoquesada/bluepad32-arduino.git libraries/Bluepad32
-          echo "== Conteudo da lib =="
-          ls -la libraries/Bluepad32
-          find libraries/Bluepad32 -maxdepth 3 -type f -name "Bluepad32.h" -print
+          # Tenta achar automaticamente a FQBN do "ESP32 Dev Module" do pacote bluepad32
+          FQBN=$(arduino-cli board listall --format json \
+            | jq -r '.boards[]
+              | select(.fqbn | test("esp32_bluepad32"))
+              | select(.name | test("ESP32 Dev Module"; "i"))
+              | .fqbn' | head -n 1)
+
+          # Fallback caso o nome venha diferente
+          if [ -z "$FQBN" ] || [ "$FQBN" = "null" ]; then
+            FQBN="esp32_bluepad32:esp32:esp32"
+          fi
+
+          echo "fqbn=$FQBN" >> $GITHUB_OUTPUT
+          echo "Usando FQBN: $FQBN"
 
       - name: Create Git Tag (if needed)
         run: |
@@ -60,7 +73,7 @@ jobs:
 
           TAG="v${{ steps.version.outputs.version }}"
           if git rev-parse "$TAG" >/dev/null 2>&1; then
-            echo "Tag $TAG já existe. OK."
+            echo "Tag $TAG já existe."
           else
             git tag -a "$TAG" -m "Release $TAG"
             git push origin "$TAG"
@@ -68,19 +81,19 @@ jobs:
 
       - name: Compile firmware
         run: |
-          # Ajuste a board aqui se precisar (FQBN)
-          # Exemplo comum: esp32:esp32:esp32
           arduino-cli compile \
-            --fqbn esp32:esp32:esp32 \
-            --libraries "$GITHUB_WORKSPACE/libraries"
+            --fqbn "${{ steps.fqbn.outputs.fqbn }}" \
             --export-binaries \
             --output-dir build \
             .
 
-          # Normalmente gera um .bin com nome do sketch.
-          # Padroniza para CarReceiver.bin
-          BIN=$(ls -1 build/*.bin | head -n 1)
-          echo "BIN gerado: $BIN"
+          echo "Arquivos gerados:"
+          ls -lah build
+
+          # Escolhe o BIN do APP (evita bootloader/partitions)
+          # Geralmente o maior .bin é o firmware do sketch.
+          BIN=$(ls -S build/*.bin | head -n 1)
+          echo "BIN escolhido: $BIN"
           cp "$BIN" build/CarReceiver.bin
 
       - name: Create/Update GitHub Release and upload asset
