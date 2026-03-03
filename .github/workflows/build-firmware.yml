@@ -29,6 +29,7 @@ jobs:
           arduino-cli core update-index
           # Instala o core oficial + o Bluepad32 embutido (versão mais recente, compatível com 3.x)
           arduino-cli core install esp32:esp32    # <-- este é o segredo!
+          arduino-cli core install esp32:esp32_bluepad32    # <-- este é o segredo!
       
       - name: Debug Show installed cores and boards
         run: |
