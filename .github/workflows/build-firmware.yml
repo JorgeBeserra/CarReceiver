@@ -40,7 +40,10 @@ jobs:
       - name: Install Bluepad32 library
         run: |
           # Instala a biblioteca Bluepad32 via git
+          arduino-cli config set library.enable_unsafe_install true
           arduino-cli lib install --git-url https://github.com/ricardoquesada/bluepad32.git
+          echo "Bibliotecas instaladas:"
+          arduino-cli lib list
 
       - name: Show environment (debug)
         run: |
