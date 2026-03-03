@@ -4,13 +4,38 @@
 #include <WiFiClientSecure.h>
 #include <HTTPUpdate.h>
 #include "esp_wifi.h"
+#include <DNSServer.h>
+#include <WebServer.h>
+#include <DNSServer.h>
+#include <Preferences.h>
+#include "ESP32MQTTClient.h"
+#include <ArduinoJson.h>
+#include <ESPping.h>
 
 static const char* GITHUB_LATEST = "https://api.github.com/repos/JorgeBeserra/CarReceiver/releases/latest";
 
 //============================================================
 // ⚙️ Mapeamento de Hardware e Parâmetros
 //============================================================
-#define FIRMWARE_VERSION "1.0.2"
+#define FIRMWARE_VERSION "1.0.4"
+
+//============================================================
+// 📡 Configuração WiFi com Portal
+//============================================================
+#define WIFI_TIMEOUT 20000          // 20 segundos para tentar conectar
+#define PORTAL_TIMEOUT 300000       // 5 minutos no portal (depois reinicia)
+String ap_ssid;
+#define AP_PASSWORD "12345678"      // Senha do portal (mínimo 8 caracteres)
+#define AP_IP "192.168.4.1"         // IP do Access Point
+
+#define MQTT_SOCKET_TIMEOUT 15  
+
+// DNS para captive portal
+WebServer server(80);
+DNSServer dnsServer;
+
+// Preferences para salvar na flash
+Preferences preferences;
 
 // 🟦 Pinos
 // Controle
@@ -84,7 +109,7 @@ const int HORN_DURATION_MS = 500;
 const int HORN_SWEEP_MS = 100;
 int currentHornFrequency = HORN_FREQUENCY_HIGH;
 bool isHornSweepUp = false;
-unsigned long hornStartTime = 0;
+uint32_t hornStartTime = 0;
 bool isHornPlaying = false;
 
 // ====== BUZINA "FON FON" (buzzer passivo) ======
@@ -97,11 +122,11 @@ const int HORN_DUTY_OFF = 0;
 
 bool prevX = false;
 bool hornToggle = false;
-unsigned long lastHornToggle = 0;
+uint32_t lastHornToggle = 0;
 
 // ====== PISCA ======
-const unsigned long BLINK_INTERVAL_MS = 450;
-unsigned long lastBlinkMs = 0;
+const uint16_t BLINK_INTERVAL_MS = 450;
+uint32_t lastBlinkMs = 0;
 bool blinkState = false;
 
 bool hazardOn = false;      // pisca alerta (triângulo)
@@ -154,6 +179,644 @@ int pwmL = 0, pwmR = 0;
 static unsigned long otaPressStart = 0;
 static bool otaHolding = false;
 
+char *subscribeTopic = "foo";
+char *publishTopic = "bar/bar";
+
+
+// ===== CONFIGURAÇÕES MQTT =====
+struct MQTTConfig {
+  String server;
+  int port;
+  String user;
+  String password;
+  String topic_status;
+  String topic_comandos;
+  String topic_telemetria;
+  bool enabled;
+};
+
+
+MQTTConfig mqtt_config;
+ESP32MQTTClient mqttClient;
+bool mqtt_connected = false;
+String lastMqttMessage = "";
+int lastMqttAttempt = 0;
+
+void loadMQTTConfig() {
+  preferences.begin("mqtt", true);
+  mqtt_config.server = preferences.getString("server", "");
+  mqtt_config.port = preferences.getInt("port", 1883);
+  mqtt_config.user = preferences.getString("user", "");
+  mqtt_config.password = preferences.getString("password", "");
+  mqtt_config.topic_status = preferences.getString("topic_status", "carrinho/status");
+  mqtt_config.topic_comandos = preferences.getString("topic_comandos", "carrinho/comandos");
+  mqtt_config.topic_telemetria = preferences.getString("topic_telemetria", "carrinho/telemetria");
+  mqtt_config.enabled = preferences.getBool("enabled", false);
+  preferences.end();
+  
+  Serial.println(F("\n📂 CONFIGURAÇÕES MQTT CARREGADAS:"));
+  Serial.print(F("  Servidor: "));
+  Serial.println(mqtt_config.server);
+  Serial.print(F("  Porta: "));
+  Serial.println(mqtt_config.port);
+  Serial.print(F("  Usuário: "));
+  Serial.println(mqtt_config.user);
+  Serial.print(F("  Status Topic: "));
+  Serial.println(mqtt_config.topic_status);
+  Serial.print(F("  Comandos Topic: "));
+  Serial.println(mqtt_config.topic_comandos);
+  Serial.print(F("  Enabled: "));
+  Serial.println(mqtt_config.enabled ? "Sim" : "Não");
+}
+
+void saveMQTTConfig(MQTTConfig config) {
+  preferences.begin("mqtt", false);
+  preferences.putString("server", config.server);
+  preferences.putInt("port", config.port);
+  preferences.putString("user", config.user);
+  preferences.putString("password", config.password);
+  preferences.putString("topic_status", config.topic_status);
+  preferences.putString("topic_comandos", config.topic_comandos);
+  preferences.putString("topic_telemetria", config.topic_telemetria);
+  preferences.putBool("enabled", config.server.length() > 0);
+  preferences.end();
+  
+  mqtt_config = config;
+  Serial.println(F("✅ Configurações MQTT salvas"));
+}
+
+void iniciarMQTT() {
+  if (!mqtt_config.enabled || mqtt_config.server.length() == 0) {
+    Serial.println(F("⚠️ MQTT não configurado"));
+    return;
+  }
+  
+  Serial.println(F("\n📡 Iniciando MQTT com configurações salvas..."));
+  
+  // Monta URI no formato correto
+  String uri = "mqtt://" + mqtt_config.server + ":" + String(mqtt_config.port);
+  
+  // Configura cliente MQTT
+  mqttClient.setURI(uri.c_str(), 
+                    mqtt_config.user.c_str(), 
+                    mqtt_config.password.c_str());
+  mqttClient.setMqttClientName("BattleCar");
+
+  
+  Serial.println(F("✅ MQTT iniciado"));
+}
+
+void callback(char* topic, byte* payload, unsigned int length) {
+  String message;
+  for (int i = 0; i < length; i++) {
+    message += (char)payload[i];
+  }
+  
+  lastMqttMessage = "[" + String(topic) + "] " + message;
+  Serial.printf("📩 MQTT: %s\n", lastMqttMessage.c_str());
+  
+  // Processa comandos aqui
+  if (String(topic) == mqtt_config.topic_comandos) {
+    if (message == "buzina") {
+      ledcWrite(BUZZER_CHANNEL, HORN_DUTY_ON);
+      delay(500);
+      ledcWrite(BUZZER_CHANNEL, HORN_DUTY_OFF);
+    }
+    else if (message == "status") {
+      enviarStatusMQTT();
+    }
+  }
+}
+
+void enviarStatusMQTT() {
+  if (!mqttClient.isConnected()) return;
+
+  String statusTopic = "tele/battlecar_" + getMacSuffix() + "/STATE";
+  
+  String json = "{";
+  json += "\"versao\":\"" + String(FIRMWARE_VERSION) + "\",";
+  json += "\"farol_baixo\":" + String(farolBaixoAcendido ? "true" : "false") + ",";
+  json += "\"farol_alto\":" + String(farolAltoAcendido ? "true" : "false") + ",";
+  json += "\"seta_esquerda\":" + String(leftBlinkOn ? "true" : "false") + ",";
+  json += "\"seta_direita\":" + String(rightBlinkOn ? "true" : "false") + ",";
+  json += "\"pisca_alerta\":" + String(hazardOn ? "true" : "false") + ",";
+  json += "\"movimento\":" + String(currentSentidoMovimento) + ",";
+  json += "\"direcao\":" + String(currentSentidoDirecao);
+  json += "}";
+  
+  mqttClient.publish(statusTopic.c_str(), json.c_str(), 0, false);
+  Serial.println(F("📤 Status publicado"));
+}
+
+void testarConectividade() {
+  Serial.println(F("\n🔍 TESTE DE CONECTIVIDADE:"));
+  
+  // 1. Teste ping no gateway
+  IPAddress gateway = WiFi.gatewayIP();
+  Serial.print(F("  Ping gateway ("));
+  Serial.print(gateway);
+  Serial.print(F("): "));
+  bool pingGateway = Ping.ping(gateway);
+  Serial.println(pingGateway ? F("✅") : F("❌"));
+  
+  // 2. Teste ping no Home Assistant
+  IPAddress haIP(192,168,10,100);  // IP do seu HA
+  Serial.print(F("  Ping Home Assistant ("));
+  Serial.print(haIP);
+  Serial.print(F("): "));
+  bool pingHA = Ping.ping(haIP);
+  Serial.println(pingHA ? F("✅") : F("❌"));
+  
+  // 3. Teste de resolução DNS
+  IPAddress dnsTest;
+  Serial.print(F("  Resolver DNS (google.com): "));
+  if (WiFi.hostByName("google.com", dnsTest)) {
+    Serial.print(F("✅ "));
+    Serial.println(dnsTest);
+  } else {
+    Serial.println(F("❌"));
+  }
+  
+  // 4. Teste de porta 1883 (MQTT)
+  Serial.print(F("  Teste porta 1883 no HA: "));
+  WiFiClient testClient;
+  if (testClient.connect(haIP, 1883, 2000)) {
+    Serial.println(F("✅ ABERTA"));
+    testClient.stop();
+  } else {
+    Serial.println(F("❌ FECHADA ou BLOQUEADA"));
+  }
+}
+
+void reconnectMQTT() {
+  if (!mqtt_config.enabled || mqtt_config.server.length() == 0) {
+    Serial.println(F("⚠️ MQTT não configurado"));
+    return;
+  }
+
+  if (mqttClient.isConnected()) {
+    return;
+  }
+
+  if (millis() - lastMqttAttempt < 5000) return;  // Tenta a cada 5s
+  
+  lastMqttAttempt = millis();
+  
+  Serial.println(F("\n📡 Tentando reconectar MQTT..."));
+
+
+  // Monta URI com as configurações atuais
+  String uri = "mqtt://" + mqtt_config.server + ":" + String(mqtt_config.port);
+
+  Serial.println(uri);
+  
+  String clientId = "BattleCar-" + String(random(0xffff), HEX);
+
+  // Configura cliente MQTT
+  mqttClient.setURI(uri.c_str(), 
+                    mqtt_config.user.c_str(), 
+                    mqtt_config.password.c_str());
+  mqttClient.setMqttClientName("BattleCar");
+
+  mqttClient.loopStart();
+
+  // Pequeno delay para verificar se conectou
+  delay(500);
+
+  
+  if (mqttClient.isConnected()) {
+    Serial.println(F("✅ Reconexão bem sucedida!"));
+  } else {
+    Serial.println(F("❌ Falha na reconexão"));
+    mqtt_connected = false;
+  }
+}
+
+// Variáveis de controle
+String savedSSID = "";
+String savedPassword = "";
+bool portalAtivo = false;
+bool wifiConectado = false;
+unsigned long portalStartTime = 0;
+unsigned long lastWifiAttempt = 0;
+int wifiAttempts = 0;
+
+// HTML mínimo e eficiente
+const char index_html[] PROGMEM = R"rawliteral(
+<!DOCTYPE html>
+<html>
+<head>
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta charset="UTF-8">
+  <title>Configurar WiFi</title>
+  <style>
+    body{font-family:Arial;text-align:center;margin:20px;background:#f0f0f0}
+    .container{background:white;padding:20px;border-radius:10px;max-width:400px;margin:0 auto}
+    input,select,button{width:100%;padding:12px;margin:8px 0;border:1px solid #ddd;border-radius:5px;box-sizing:border-box}
+    button{background:#4CAF50;color:white;border:none;cursor:pointer}
+    button:hover{background:#45a049}
+    #status{margin-top:15px;padding:10px;border-radius:5px;display:none}
+    .success{background:#d4edda;color:#155724;display:block}
+    .error{background:#f8d7da;color:#721c24;display:block}
+  </style>
+</head>
+<body>
+  <div class="container">
+    <h2>📶 Configurar WiFi</h2>
+    <form id="wifiForm" onsubmit="connect(event)">
+      <select id="ssid" required>
+        <option value="">Selecione uma rede</option>
+      </select>
+      <input type="password" id="password" placeholder="Senha">
+      <button type="submit">Conectar</button>
+    </form>
+    <div id="status"></div>
+  </div>
+  <script>
+    fetch('/scan').then(r=>r.json()).then(networks=>{
+      const select = document.getElementById('ssid');
+      networks.sort((a,b)=>b.rssi-a.rssi).forEach(n=>{
+        const option = document.createElement('option');
+        option.value = n.ssid;
+        option.text = n.ssid + (n.secure ? ' 🔒' : ' 🔓');
+        select.appendChild(option);
+      });
+    });
+    function connect(e){
+      e.preventDefault();
+      const ssid = document.getElementById('ssid').value;
+      const pwd = document.getElementById('password').value;
+      if(!ssid) return;
+      document.querySelector('button').disabled = true;
+      fetch('/connect', {
+        method:'POST',
+        headers:{'Content-Type':'application/x-www-form-urlencoded'},
+        body:`ssid=${encodeURIComponent(ssid)}&password=${encodeURIComponent(pwd)}`
+      }).then(()=>{
+        showStatus('Conectando...', 'success');
+        setTimeout(()=>window.location.href='/', 2000);
+      });
+    }
+    function showStatus(msg,type){
+      const div = document.getElementById('status');
+      div.className = type;
+      div.textContent = msg;
+    }
+  </script>
+</body>
+</html>
+)rawliteral";
+
+// HTML para configuração MQTT (adicione após o index_html existente)
+const char mqtt_html[] PROGMEM = R"rawliteral(
+<!DOCTYPE html>
+<html>
+<head>
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta charset="UTF-8">
+  <title>Configurar MQTT - Carrinho</title>
+  <style>
+    body{font-family:Arial;text-align:center;margin:20px;background:#f0f0f0}
+    .container{background:white;padding:20px;border-radius:10px;max-width:400px;margin:0 auto}
+    input,button{width:100%;padding:12px;margin:8px 0;border:1px solid #ddd;border-radius:5px;box-sizing:border-box}
+    button{background:#2196F3;color:white;border:none;cursor:pointer}
+    button:hover{background:#1976D2}
+    button.danger{background:#f44336}
+    button.danger:hover{background:#d32f2f}
+    .status{margin-top:15px;padding:10px;border-radius:5px;display:none}
+    .success{background:#d4edda;color:#155724;display:block}
+    .error{background:#f8d7da;color:#721c24;display:block}
+    .info{background:#d1ecf1;color:#0c5460;display:block}
+    .header{display:flex;justify-content:space-between;align-items:center}
+    .title{color:#2196F3}
+    .card{background:#f8f9fa;border-radius:8px;padding:15px;margin:15px 0;text-align:left}
+    .card h3{margin-top:0;color:#666}
+    .info-text{color:#666;font-size:12px;margin-top:20px}
+    .tab{overflow:hidden;border:1px solid #ccc;background-color:#f1f1f1;border-radius:5px 5px 0 0}
+    .tab button{background-color:inherit;float:left;border:none;outline:none;cursor:pointer;padding:12px 16px;transition:0.3s;width:50%}
+    .tab button:hover{background-color:#ddd}
+    .tab button.active{background-color:#2196F3;color:white}
+    .tabcontent{display:none;padding:20px;border:1px solid #ccc;border-top:none;border-radius:0 0 5px 5px}
+  </style>
+</head>
+<body>
+  <div class="container">
+    <div class="header">
+      <h2 class="title">⚙️ Configurar MQTT</h2>
+      <div>🔌 <span id="mqttStatus">Desconectado</span></div>
+    </div>
+    
+    <div class="tab">
+      <button class="tablinks active" onclick="openTab(event, 'Config')">Configurações</button>
+      <button class="tablinks" onclick="openTab(event, 'Status')">Status</button>
+    </div>
+
+    <div id="Config" class="tabcontent" style="display:block">
+      <form id="mqttForm" onsubmit="saveMQTT(event)">
+        <div class="card">
+          <h3>📡 Servidor MQTT</h3>
+          <input type="text" id="server" placeholder="IP do Broker (ex: 192.168.10.100)" required>
+          <input type="text" id="port" placeholder="Porta (padrão: 1883)" value="1883" required>
+        </div>
+        
+        <div class="card">
+          <h3>🔐 Autenticação</h3>
+          <input type="text" id="user" placeholder="Usuário">
+          <input type="password" id="password" placeholder="Senha">
+        </div>
+        
+        <div class="card">
+          <h3>📋 Tópicos</h3>
+          <input type="text" id="topic_status" placeholder="Tópico Status" value="/tele/battlecar_%/status">
+          <input type="text" id="topic_comandos" placeholder="Tópico Comandos" value="/carrinho/comandos">
+          <input type="text" id="topic_telemetria" placeholder="Tópico Telemetria" value="/carrinho/telemetria">
+        </div>
+        
+        <button type="submit">💾 Salvar e Testar Conexão</button>
+      </form>
+      
+      <button class="danger" onclick="testMQTT()" style="margin-top:10px">🔌 Testar Conexão</button>
+      <button class="danger" onclick="clearMQTT()" style="margin-top:10px">🗑️ Limpar Configurações</button>
+    </div>
+
+    <div id="Status" class="tabcontent">
+      <div class="card">
+        <h3>📊 Informações do Carrinho</h3>
+        <p><strong>IP:</strong> <span id="ipInfo">carregando...</span></p>
+        <p><strong>MAC:</strong> <span id="macInfo">carregando...</span></p>
+        <p><strong>WiFi:</strong> <span id="wifiInfo">carregando...</span></p>
+        <p><strong>Versão:</strong> <span id="versaoInfo">carregando...</span></p>
+      </div>
+      
+      <div class="card">
+        <h3>📡 Status MQTT</h3>
+        <p><strong>Servidor:</strong> <span id="mqttServer">-</span></p>
+        <p><strong>Usuário:</strong> <span id="mqttUser">-</span></p>
+        <p><strong>Conexão:</strong> <span id="mqttConn">Desconectado</span></p>
+        <p><strong>Última mensagem:</strong> <span id="lastMsg">-</span></p>
+      </div>
+      
+      <div class="card">
+        <h3>🚗 Status do Carrinho</h3>
+        <p><strong>Faróis:</strong> <span id="farois">-</span></p>
+        <p><strong>Setas:</strong> <span id="setas">-</span></p>
+        <p><strong>Movimento:</strong> <span id="movimento">-</span></p>
+      </div>
+    </div>
+
+    <div id="status" class="status"></div>
+    <div class="info-text">
+      Após salvar, o carrinho tentará conectar ao broker MQTT automaticamente
+    </div>
+  </div>
+
+  <script>
+    function openTab(evt, tabName) {
+      var i, tabcontent, tablinks;
+      tabcontent = document.getElementsByClassName("tabcontent");
+      for (i = 0; i < tabcontent.length; i++) {
+        tabcontent[i].style.display = "none";
+      }
+      tablinks = document.getElementsByClassName("tablinks");
+      for (i = 0; i < tablinks.length; i++) {
+        tablinks[i].className = tablinks[i].className.replace(" active", "");
+      }
+      document.getElementById(tabName).style.display = "block";
+      evt.currentTarget.className += " active";
+    }
+
+    // Carrega configurações ao iniciar
+    window.onload = function() {
+      loadConfig();
+      loadStatus();
+      setInterval(loadStatus, 5000); // Atualiza status a cada 5s
+    };
+
+    function loadConfig() {
+      fetch('/mqtt_config')
+        .then(r => r.json())
+        .then(config => {
+          document.getElementById('server').value = config.server || '';
+          document.getElementById('port').value = config.port || '1883';
+          document.getElementById('user').value = config.user || '';
+          document.getElementById('topic_status').value = config.topic_status || 'carrinho/status';
+          document.getElementById('topic_comandos').value = config.topic_comandos || 'carrinho/comandos';
+          document.getElementById('topic_telemetria').value = config.topic_telemetria || 'carrinho/telemetria';
+          
+          document.getElementById('mqttServer').textContent = config.server || '-';
+          document.getElementById('mqttUser').textContent = config.user || 'anônimo';
+        });
+    }
+
+    function loadStatus() {
+      fetch('/status')
+        .then(r => r.json())
+        .then(status => {
+          document.getElementById('ipInfo').textContent = status.ip || '-';
+          document.getElementById('macInfo').textContent = status.mac || '-';
+          document.getElementById('wifiInfo').textContent = status.wifi || '-';
+          document.getElementById('versaoInfo').textContent = status.versao || '-';
+          
+          document.getElementById('mqttConn').textContent = status.mqtt_connected ? 'Conectado' : 'Desconectado';
+          document.getElementById('mqttConn').style.color = status.mqtt_connected ? '#4CAF50' : '#f44336';
+          document.getElementById('mqttStatus').textContent = status.mqtt_connected ? 'Conectado' : 'Desconectado';
+          document.getElementById('mqttStatus').style.color = status.mqtt_connected ? '#4CAF50' : '#f44336';
+          
+          document.getElementById('farois').textContent = status.farois || '-';
+          document.getElementById('setas').textContent = status.setas || '-';
+          document.getElementById('movimento').textContent = status.movimento || '-';
+          
+          if (status.last_message) {
+            document.getElementById('lastMsg').textContent = status.last_message;
+          }
+        });
+    }
+
+    function saveMQTT(event) {
+      event.preventDefault();
+      
+      const config = {
+        server: document.getElementById('server').value,
+        port: document.getElementById('port').value,
+        user: document.getElementById('user').value,
+        password: document.getElementById('password').value,
+        topic_status: document.getElementById('topic_status').value,
+        topic_comandos: document.getElementById('topic_comandos').value,
+        topic_telemetria: document.getElementById('topic_telemetria').value
+      };
+
+      fetch('/mqtt_save', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify(config)
+      })
+      .then(r => r.text())
+      .then(data => {
+        showStatus('✅ Configurações salvas! Testando conexão...', 'success');
+        setTimeout(() => testMQTT(), 1000);
+      });
+    }
+
+    function testMQTT() {
+      showStatus('🔌 Testando conexão MQTT...', 'info');
+      fetch('/mqtt_test')
+        .then(r => r.text())
+        .then(data => {
+          if (data == 'OK') {
+            showStatus('✅ Conexão MQTT bem sucedida!', 'success');
+          } else {
+            showStatus('❌ Falha na conexão MQTT', 'error');
+          }
+          loadStatus();
+        });
+    }
+
+    function clearMQTT() {
+      if (confirm('Tem certeza que deseja limpar todas as configurações MQTT?')) {
+        fetch('/mqtt_clear', {method: 'POST'})
+          .then(r => r.text())
+          .then(data => {
+            showStatus('🗑️ Configurações apagadas', 'success');
+            loadConfig();
+          });
+      }
+    }
+
+    function showStatus(msg, type) {
+      const div = document.getElementById('status');
+      div.className = 'status ' + type;
+      div.textContent = msg;
+    }
+  </script>
+</body>
+</html>
+)rawliteral";
+
+void startConfigPortal() {
+  
+  String macSuffix = getMacSuffix();
+
+  ap_ssid = "BattleCar_" + macSuffix;
+
+  WiFi.mode(WIFI_AP);
+
+  // ✅ CONFIGURAÇÕES CRÍTICAS PARA IPHONE
+  WiFi.softAPConfig(IPAddress(192,168,4,1), 
+                    IPAddress(192,168,4,1), 
+                    IPAddress(255,255,255,0));
+  
+  // Parâmetros importantes para compatibilidade
+  bool result = WiFi.softAP(ap_ssid.c_str(), AP_PASSWORD);
+  
+  Serial.print(F("softAP() retornou: "));
+  Serial.println(result ? "✅SUCESSO" : "❌FALHA");
+
+  if (!result) {
+    Serial.println(F("❌ ERRO CRÍTICO: Falha ao criar Access Point!"));
+    return;
+  }
+
+  Serial.println(F("⏳ Aguardando WiFi estabilizar..."));
+  delay(500);  // CRÍTICO: Dá tempo para o WiFi iniciar completamente
+  
+  Serial.println(F("🌐 Iniciando DNS Server..."));
+  dnsServer.start(53, "*", WiFi.softAPIP());
+  delay(100);
+
+   Serial.println(F("📡 Configurando servidor web..."));
+
+  // Rota principal
+  server.on("/", HTTP_GET, []() {
+    server.send(200, "text/html", index_html);
+  });
+  
+  // Escaneamento de redes
+  server.on("/scan", HTTP_GET, []() {
+    Serial.println(F("📡 Scan de redes iniciado..."));
+
+    WiFi.scanDelete();
+    
+    // Inicia scan
+    int n = WiFi.scanComplete();
+    if (n == -2) {
+      WiFi.scanNetworks(true);
+      
+      // Aguarda scan completar (até 5 segundos)
+      int timeout = 0;
+      while (WiFi.scanComplete() == -1 && timeout < 50) {
+        delay(100);
+        timeout++;
+      }
+      n = WiFi.scanComplete();
+    }
+    
+    String json = "[";
+    
+    if (n > 0) {
+      for (int i = 0; i < n; i++) {
+        if (i) json += ",";
+        
+        String ssid = WiFi.SSID(i);
+        ssid.replace("\"", "\\\"");  // Escapa aspas
+        
+        json += "{\"ssid\":\"" + ssid + "\",";
+        json += "\"rssi\":" + String(WiFi.RSSI(i)) + ",";
+        json += "\"secure\":" + String(WiFi.encryptionType(i) != WIFI_AUTH_OPEN ? "true" : "false") + "}";
+      }
+      WiFi.scanDelete();
+    }
+    
+    json += "]";
+    server.send(200, "application/json", json);
+    Serial.printf("✅ %d redes enviadas\n", n > 0 ? n : 0);
+  });
+  
+  // Recebe credenciais
+  server.on("/connect", HTTP_POST, []() {
+    if (server.hasArg("ssid") && server.hasArg("password")) {
+      String ssid = server.arg("ssid");
+      String pass = server.arg("password");
+      
+      preferences.begin("wifi", false);
+      preferences.putString("ssid", ssid);
+      preferences.putString("password", pass);
+      preferences.end();
+      
+      server.send(200, "text/plain", "OK");
+      delay(100);
+      ESP.restart();
+    } else {
+      server.send(400, "text/plain", "BAD");
+    }
+  });
+  
+  // Captive portal
+  server.onNotFound([]() {
+    server.sendHeader("Location", "http://" + WiFi.softAPIP().toString(), true);
+    server.send(302, "text/plain", "");
+  });
+  
+  server.begin();
+  delay(100);
+  // ===== 7. VERIFICA SE TUDO ESTÁ OK =====
+  Serial.println(F("\n🔍 VERIFICAÇÃO DO PORTAL:"));
+  Serial.print(F("📱 Rede: "));
+  Serial.println(ap_ssid);
+  Serial.print(F("🔑 Senha: "));
+  Serial.println(AP_PASSWORD);
+  Serial.print(F("🌐 IP do AP: "));
+  Serial.println(WiFi.softAPIP());
+  Serial.print(F("📡 DNS Server: "));
+  
+  Serial.print(F("🌍 Servidor Web: "));
+  
+  Serial.println(F("================================\n"));
+
+  portalAtivo = true;
+  portalStartTime = millis();
+}
+
+
 static inline int applyDeadzone(int v, int dz) {
   if (abs(v) <= dz) return 0;
   int s = (v > 0) ? 1 : -1;
@@ -185,7 +848,7 @@ static bool testDNS(const char* host) {
   if (ok) {
     Serial.println(ip);
   } else {
-    Serial.println("FALHOU");
+    Serial.println(F("FALHOU"));
   }
   return ok;
 }
@@ -298,6 +961,22 @@ bool bdEquals(const uint8_t* bd,
          bd[3]==d && bd[4]==e && bd[5]==f;
 }
 
+String getMacAddress() {
+  uint8_t mac[6];
+  esp_read_mac(mac, ESP_MAC_WIFI_STA);
+  char macStr[18] = {0};
+  sprintf(macStr, "%02X:%02X:%02X:%02X:%02X:%02X", mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
+  return String(macStr);
+}
+
+String getMacSuffix() {
+  uint8_t mac[6];
+  esp_read_mac(mac, ESP_MAC_WIFI_STA);
+  char macStr[18] = {0};
+  sprintf(macStr, "%02X%02X%02X%02X%02X%02X", mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
+  return String(macStr).substring(6); // Retorna os últimos 6 dígitos
+}
+
 void setControllerColorByCarMac(ControllerPtr ctl) {
   const uint8_t* bd = BP32.localBdAddress(); // MAC do carrinho (ESP32)
 
@@ -336,7 +1015,7 @@ void onConnectedController(ControllerPtr ctl) {
         }
     }
     if (!foundEmptySlot) {
-        Serial.println("CALLBACK: Controller connected, but could not found empty slot");
+        Serial.println(F("CALLBACK: Controller connected, but could not found empty slot"));
     }
 }
 
@@ -357,17 +1036,6 @@ void onDisconnectedController(ControllerPtr ctl) {
     }
 }
 
-
-void dumpBalanceBoard(ControllerPtr ctl) {
-    Serial.printf("idx=%d,  TL=%u, TR=%u, BL=%u, BR=%u, temperature=%d\n",
-                   ctl->index(),        // Controller Index
-                   ctl->topLeft(),      // top-left scale
-                   ctl->topRight(),     // top-right scale
-                   ctl->bottomLeft(),   // bottom-left scale
-                   ctl->bottomRight(),  // bottom-right scale
-                   ctl->temperature()   // temperature: used to adjust the scale value's precision
-    );
-}
 
 // int moveMotores(int sentidoX, int steeringY, int throttleR2) {
 //   int sentido = map(sentidoX, -120, 120, -255, 255);
@@ -514,7 +1182,7 @@ static bool githubGetLatest(String& outVersion, String& outBinUrl) {
   Serial.printf("[OTA] GET: %s\n", GITHUB_LATEST);
 
   if (!https.begin(client, GITHUB_LATEST)) {
-    Serial.println("[OTA] https.begin() falhou");
+    Serial.println(F("[OTA] https.begin() falhou"));
     return false;
   }
 
@@ -534,7 +1202,7 @@ static bool githubGetLatest(String& outVersion, String& outBinUrl) {
 
   int tagIndex = payload.indexOf("\"tag_name\":\"");
   if (tagIndex < 0) {
-    Serial.println("[OTA] tag_name nao encontrado");
+    Serial.println(F("[OTA] tag_name nao encontrado"));
     return false;
   }
   int vStart = tagIndex + strlen("\"tag_name\":\"");
@@ -558,10 +1226,6 @@ static bool githubGetLatest(String& outVersion, String& outBinUrl) {
   return true;
 }
 
-
-const char* WIFI_SSID = "";
-const char* WIFI_PASS = "";
-
 static bool wifiConnectedForOTA() {
   return WiFi.status() == WL_CONNECTED;
 }
@@ -570,75 +1234,103 @@ static void wifiOff() {
   WiFi.disconnect(false);
   WiFi.mode(WIFI_OFF);
   delay(50);
-  Serial.println("[WiFi] OFF");
+  Serial.println(F("[WiFi] OFF"));
 }
 
 static bool wifiOnAndConnect(uint32_t timeoutMs = 15000) {  
-  Serial.println("[WiFi] Ligando p/ OTA...");
+  Serial.println(F("[WiFi] Ligando p/ OTA..."));
+
+  if (savedSSID.length() == 0) {
+    Serial.println(F("[WiFi] Sem credenciais salvas."));
+    return false;
+  }
+
+  Serial.print(F("[OTA] Firmware atual: "));
+  Serial.printf(FIRMWARE_VERSION);
   esp_wifi_set_ps(WIFI_PS_MIN_MODEM);
   WiFi.mode(WIFI_STA);
   WiFi.config(INADDR_NONE, INADDR_NONE, INADDR_NONE, IPAddress(1,1,1,1), IPAddress(8,8,8,8));
-  WiFi.begin(WIFI_SSID, WIFI_PASS);
+  WiFi.begin(savedSSID.c_str(), savedPassword.c_str());
 
   uint32_t t0 = millis();
   while (WiFi.status() != WL_CONNECTED && (millis() - t0) < timeoutMs) {
     delay(250);
     Serial.print(".");
   }
+
   Serial.println();
 
   if (WiFi.status() == WL_CONNECTED) {
-    Serial.print("[WiFi] OK IP: ");
+    Serial.print(F("[WiFi] OK IP: "));
     Serial.println(WiFi.localIP());
     return true;
   }
 
-  Serial.println("[WiFi] Falhou conectar.");
+  Serial.println(F("[WiFi] Falhou conectar."));
   return false;
 }
+bool otaEmAndamento = false;
+
+auto finalizarOTA = [&]() {
+  otaEmAndamento = false;
+};
 
 static void otaCheckAndUpdateESP32() {
+  
+
+  if (otaEmAndamento) {
+    Serial.println(F("[OTA] Já em andamento, ignorando nova chamada."));
+    return;
+  }
+
+  otaEmAndamento = true;
+
   if (!wifiConnectedForOTA()) {
     if (!wifiOnAndConnect(15000)) {
       wifiOff();
+      finalizarOTA();
       return;
     }
   }
 
-  Serial.printf("[OTA] Firmware atual: v%s\n", FIRMWARE_VERSION);
+  Serial.print(F("[OTA] Firmware atual: "));
+  Serial.println(FIRMWARE_VERSION);
 
   testDNS("api.github.com");
   testDNS("github.com");
 
   String latestVersion, binUrl;
   if (!githubGetLatest(latestVersion, binUrl)) {
-    Serial.println("[OTA] Falha ao consultar GitHub.");
+    Serial.println(F("[OTA] Falha ao consultar GitHub."));
     return;
   }
 
-  Serial.printf("[OTA] Última versão: %s\n", latestVersion.c_str());
-  Serial.printf("[OTA] Bin: %s\n", binUrl.c_str());
+  Serial.print(F("[OTA] Última versão: "));
+  Serial.println(latestVersion.c_str());
+  Serial.print(F("[OTA] Bin: "));
+  Serial.println(binUrl.c_str());
 
   if (!isNewerVersionESP32(String(FIRMWARE_VERSION), latestVersion)) {
-    Serial.println("[OTA] Já está atualizado.");
+    Serial.println(F("[OTA] Já está atualizado."));
+    finalizarOTA();
     return;
   }
 
   // Segurança: para motores, apaga saídas críticas
-
-  Serial.println("[OTA] Pausando Bluetooth p/ atualizar...");
-  BP32.enableNewBluetoothConnections(false); // pelo menos impede novas conexões
   rotateMotor(0,0);
-  otaCheckAndUpdateESP32();
+
+  Serial.println(F("[OTA] Pausando Bluetooth p/ atualizar..."));
+  BP32.enableNewBluetoothConnections(false); // pelo menos impede novas conexões
+  delay(50);
   // se não reiniciar, reabilita conexões:
-  BP32.enableNewBluetoothConnections(true);
+ 
 
   WiFiClientSecure client;
   client.setInsecure();
 
   httpUpdate.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);
 
-  Serial.println("[OTA] Iniciando update...");
+  Serial.println(F("[OTA] Iniciando update..."));
   t_httpUpdate_return ret = httpUpdate.update(client, binUrl);
 
   switch (ret) {
@@ -647,18 +1339,21 @@ static void otaCheckAndUpdateESP32() {
                     httpUpdate.getLastError(),
                     httpUpdate.getLastErrorString().c_str());
       wifiOff();
+      BP32.enableNewBluetoothConnections(true);
       break;
 
     case HTTP_UPDATE_NO_UPDATES:
-      Serial.println("[OTA] Sem updates.");
+      Serial.println(F("[OTA] Sem updates."));
+      BP32.enableNewBluetoothConnections(true);
       wifiOff();
       break;
 
     case HTTP_UPDATE_OK:
-      Serial.println("[OTA] OK! Reiniciando...");
+      Serial.println(F("[OTA] OK! Reiniciando..."));
       // aqui normalmente reinicia sozinho. Se não reiniciar, o Wi-Fi vai cair no reboot.
       break;
   }
+  otaEmAndamento = false;
 }
 
 void processGamepad(ControllerPtr ctl) {
@@ -695,7 +1390,7 @@ void processGamepad(ControllerPtr ctl) {
         farolAltoAcendido = !farolAltoAcendido;
         farolBaixoAcendido = !farolBaixoAcendido;
         stopAcendido = !stopAcendido;
-        Serial.println(">>> BOTAO B PRESSIONADO (toggle)");
+        Serial.println(F(">>> BOTAO B PRESSIONADO (toggle)"));
     }
 
     prevB = bNow;
@@ -719,7 +1414,7 @@ void processGamepad(ControllerPtr ctl) {
 if (otaCombo && otaHolding && (millis() - otaPressStart >= 5000)) {
   otaHolding = false;
 
-  Serial.println("[OTA] Triângulo+L1 5s -> checar update");
+  Serial.println(F("[OTA] Triângulo+L1 5s -> checar update"));
 
   // Segurança: para tudo antes
   rotateMotor(0, 0);
@@ -748,23 +1443,13 @@ if (otaCombo && otaHolding && (millis() - otaPressStart >= 5000)) {
 
 }
 
-void processBalanceBoard(ControllerPtr ctl) {
-    // This is just an example.
-    if (ctl->topLeft() > 10000) {
-        // Do Something
-    }
-
-    // See "dumpBalanceBoard" for possible things to query.
-    dumpBalanceBoard(ctl);
-}
-
 void processControllers() {
     for (auto myController : myControllers) {
         if (myController && myController->isConnected() && myController->hasData()) {
             if (myController->isGamepad()) {
                 processGamepad(myController);
             } else {
-                Serial.println("Unsupported controller");
+                Serial.println(F("Unsupported controller"));
             }
         }
     }
@@ -775,14 +1460,14 @@ void handleBuzzer() {    unsigned long currentTime = millis();
     if (isHornPlaying) {
         // Parar buzina se a duração máxima foi atingida
         if (currentTime - hornStartTime >= HORN_DURATION_MS) {
-            Serial.println("Horn finished.");
+            Serial.println(F("Horn finished."));
             ledcDetachPin(BUZZER_PIN); // Desliga o PWM
             isHornPlaying = false;
             // Garante que o freio desligue se estava ativo APENAS por causa da buzina
             if (currentSentidoMovimento == 0 && isXButtonPressed) { // Se estava parado e X pressionado
                 digitalWrite(FREIO, LOW);
                 freioAcendido = false;
-                Serial.println("Brake Light OFF after horn pulse.");
+                Serial.println(F("Brake Light OFF after horn pulse."));
             }
             return;
         }
@@ -808,14 +1493,26 @@ void handleBuzzer() {    unsigned long currentTime = millis();
 }
 
 
+bool loadWiFiCredentials() {
+    preferences.begin("wifi", true);
+    savedSSID = preferences.getString("ssid", "");
+    savedPassword = preferences.getString("password", "");
+    preferences.end();
+    
+    if (savedSSID.length() > 0) {
+        Serial.print(F("📂 Credenciais carregadas: "));
+        Serial.println(savedSSID.c_str());
+        return true;
+    }
+    Serial.println(F("📂 Nenhuma credencial salva"));
+    return false;
+}
+
+bool otaRequestPending = false;
 
 // Arduino setup function. Runs in CPU 1
 void setup() {
-    Serial.begin(115200);
-    Serial.printf("Firmware: %s\n", BP32.firmwareVersion());
-    const uint8_t* addr = BP32.localBdAddress();
-    Serial.printf("BD Addr: %2X:%2X:%2X:%2X:%2X:%2X\n", addr[0], addr[1], addr[2], addr[3], addr[4], addr[5]);
-    BP32.setup(&onConnectedController, &onDisconnectedController);    
+    Serial.begin(115200); 
 
     // Configura os pinos da ponte H
     pinMode(enableRightMotor, OUTPUT);
@@ -852,12 +1549,162 @@ void setup() {
     ledcAttachPin(BUZZER_PIN, BUZZER_CHANNEL);
     ledcWrite(BUZZER_CHANNEL, 0); // começa desligado
 
-    
 
+
+    // 1. Tenta carregar credenciais salvas
+    bool hasCredentials = loadWiFiCredentials();
+
+    // 2. Se tiver credenciais, tenta conectar
+    if (hasCredentials) {
+        Serial.println(F("📡 Tentando conectar ao WiFi salvo..."));
+        WiFi.mode(WIFI_STA);
+        WiFi.begin(savedSSID.c_str(), savedPassword.c_str());
+
+        // Aguarda conexão por WIFI_TIMEOUT
+        int attempts = 0;
+        while (WiFi.status() != WL_CONNECTED && attempts < WIFI_TIMEOUT / 500) {
+            delay(500);
+            Serial.print(".");
+            attempts++;
+        }
+        Serial.println();
+        
+        // Verifica se conectou
+        if (WiFi.status() == WL_CONNECTED) {
+            Serial.print(F("✅ WiFi conectado! IP: "));
+            Serial.println(WiFi.localIP());
+            Serial.println(F("\n📡 DIAGNÓSTICO DE REDE:"));
+            Serial.print(F("  IP: "));
+            Serial.println(WiFi.localIP());
+            Serial.print(F("  Gateway: "));
+            Serial.println(WiFi.gatewayIP());
+            Serial.print(F("  Máscara: "));
+            Serial.println(WiFi.subnetMask());
+            Serial.print(F("  DNS: "));
+            Serial.println(WiFi.dnsIP());
+            
+            // Teste 1: Gateway está configurado?
+            if (WiFi.gatewayIP() == IPAddress(0,0,0,0)) {
+              Serial.println(F("  ❌ GATEWAY NÃO CONFIGURADO!"));
+            } else {
+              Serial.println(F("  ✅ Gateway configurado"));
+            }
+            wifiConectado = true;
+            testarConectividade();
+            loadMQTTConfig();
+            iniciarMQTT();
+
+        } else {
+            Serial.println(F("❌ Falha na conexão WiFi"));
+            wifiConectado = false;
+        }
+        
+    }
+
+    // Bluepad32
+    Serial.printf("Firmware: %s\n", BP32.firmwareVersion());
+    BP32.setup(&onConnectedController, &onDisconnectedController);    
     BP32.forgetBluetoothKeys();    
     BP32.enableVirtualDevice(false);
 
-    wifiOff();
+    const uint8_t* addr = BP32.localBdAddress();
+    Serial.printf("BD Addr: %02X:%02X:%02X:%02X:%02X:%02X\n", 
+                  addr[0], addr[1], addr[2], addr[3], addr[4], addr[5]);
+    // 3. Se NÃO conectou, inicia o portal
+    if (!wifiConectado) {
+        Serial.println(F("🔴 Iniciando portal de configuração WiFi..."));
+        startConfigPortal();
+    } 
+
+    if (wifiConectado) {
+          loadMQTTConfig();
+
+           // Adiciona rotas para configuração MQTT
+      server.on("/mqtt", HTTP_GET, []() {
+    server.send(200, "text/html", mqtt_html);
+  });
+  
+  server.on("/mqtt_config", HTTP_GET, []() {
+    String json = "{";
+    json += "\"server\":\"" + mqtt_config.server + "\",";
+    json += "\"port\":" + String(mqtt_config.port) + ",";
+    json += "\"user\":\"" + mqtt_config.user + "\",";
+    json += "\"topic_status\":\"" + mqtt_config.topic_status + "\",";
+    json += "\"topic_comandos\":\"" + mqtt_config.topic_comandos + "\",";
+    json += "\"topic_telemetria\":\"" + mqtt_config.topic_telemetria + "\"";
+    json += "}";
+    server.send(200, "application/json", json);
+  });
+  
+  server.on("/mqtt_save", HTTP_POST, []() {
+    String json = server.arg("plain");
+    
+    // Parse JSON
+    int serverStart = json.indexOf("\"server\":\"") + 10;
+    int serverEnd = json.indexOf("\"", serverStart);
+    String server_ip = json.substring(serverStart, serverEnd);
+    
+    int portStart = json.indexOf("\"port\":\"") + 8;  // +8 porque tem aspas
+    int portEnd = json.indexOf("\"", portStart);
+    String portStr = json.substring(portStart, portEnd);
+    int port = portStr.toInt();  // Converte string para int
+    
+    int userStart = json.indexOf("\"user\":\"") + 8;
+    int userEnd = json.indexOf("\"", userStart);
+    String user = json.substring(userStart, userEnd);
+    
+    int passStart = json.indexOf("\"password\":\"") + 12;
+    int passEnd = json.indexOf("\"", passStart);
+    String pass = json.substring(passStart, passEnd);
+    
+    MQTTConfig newConfig;
+    newConfig.server = server_ip;
+    newConfig.port = port;
+    newConfig.user = user;
+    newConfig.password = pass;
+    newConfig.topic_status = "tele/battlecar_" + getMacSuffix() + "/STATE";
+    newConfig.topic_comandos = "cmnd/battlecar_" + getMacSuffix() + "/COMMAND";
+    newConfig.topic_telemetria = "carrinho/telemetria";
+    
+    saveMQTTConfig(newConfig);
+    server.send(200, "text/plain", "OK");
+  });
+  
+  server.on("/mqtt_test", HTTP_GET, []() {
+    reconnectMQTT();
+    server.send(200, "text/plain", mqtt_connected ? "OK" : "FAIL");
+  });
+  
+  server.on("/status", HTTP_GET, []() {
+    String json = "{";
+    json += "\"ip\":\"" + WiFi.localIP().toString() + "\",";
+    json += "\"mac\":\"" + WiFi.macAddress() + "\",";
+    json += "\"wifi\":\"" + String(WiFi.SSID()) + "\",";
+    json += "\"versao\":\"" + String(FIRMWARE_VERSION) + "\",";
+    json += "\"mqtt_connected\":" + String(mqtt_connected ? "true" : "false") + ",";
+    json += "\"farois\":\"" + String(farolBaixoAcendido ? "Baixo" : (farolAltoAcendido ? "Alto" : "Desligado")) + "\",";
+    json += "\"setas\":\"" + String(leftBlinkOn ? "Esquerda" : (rightBlinkOn ? "Direita" : "Desligado")) + "\",";
+    json += "\"movimento\":\"" + String(currentSentidoMovimento) + "\",";
+    json += "\"last_message\":\"" + lastMqttMessage + "\"";
+    json += "}";
+    server.send(200, "application/json", json);
+  });
+
+  server.on("/ota_update", HTTP_GET, []() {
+    if (otaRequestPending) {
+      server.send(409, "text/plain", "OTA ja solicitado");
+      return;
+    }
+
+    otaRequestPending = true;
+
+    server.send(200, "text/plain", "OTA solicitado. Verifique o serial.");
+    
+  });
+  
+  server.begin();  // Reinicia servidor com novas rotas
+  }
+
 }
 
 void updateBlinkOutputs() {
@@ -887,6 +1734,30 @@ void updateBlinkOutputs() {
 
 // Arduino loop function. Runs in CPU 1.
 void loop() {
+
+    if (portalAtivo) {
+      dnsServer.processNextRequest();
+      server.handleClient();
+      delay(10); // Delay de sobrecarga
+      return;
+    }
+
+    if (wifiConectado) {
+        server.handleClient();  
+        
+        // Gerencia MQTT
+        if (mqtt_config.enabled) {
+            if (!mqttClient.isConnected()) {
+                reconnectMQTT();
+            } 
+        }
+    }
+
+    if (otaRequestPending) {
+      otaRequestPending = false;
+      otaCheckAndUpdateESP32();
+    }
+
     // This call fetches all the controllers' data.
     // Call this function in your main loop.
     bool dataUpdated = BP32.update();
@@ -921,6 +1792,55 @@ void loop() {
 
     handleBuzzer();
 
-    // vTaskDelay(1);
     delay(5);
 }
+
+void onMqttConnect(esp_mqtt_client_handle_t client)
+{
+    Serial.println(F("✅ MQTT Conectado!"));
+    mqtt_connected = true;
+    if (mqttClient.isMyTurn(client)) // can be omitted if only one client
+    {
+        mqttClient.subscribe(mqtt_config.topic_comandos.c_str(), [](const std::string &payload) { 
+          String msg = payload.c_str();
+          Serial.printf("📩 Comando recebido: %s\n", msg.c_str());
+          
+          if (msg == "buzina") {
+            ledcWrite(BUZZER_CHANNEL, HORN_DUTY_ON);
+            delay(500);
+            ledcWrite(BUZZER_CHANNEL, HORN_DUTY_OFF);
+          }
+          else if (msg == "alerta" || msg == "pisca") {
+          Serial.println(F("  → PISCA ALERTA!"));
+          hazardOn = !hazardOn;  // Alterna o estado do pisca alerta
+          
+          // Se desligou o alerta, garante que as setas individuais voltam ao normal
+            if (!hazardOn) {
+              leftBlinkOn = false;
+              rightBlinkOn = false;
+            }
+          }
+          else if (msg == "status") {
+            enviarStatusMQTT();
+          }
+        });
+
+        // Publica status inicial
+        enviarStatusMQTT();
+    }
+}
+
+
+#if ESP_IDF_VERSION < ESP_IDF_VERSION_VAL(5, 0, 0)
+esp_err_t handleMQTT(esp_mqtt_event_handle_t event)
+{
+    mqttClient.onEventCallback(event);
+    return ESP_OK;
+}
+#else  // IDF CHECK
+void handleMQTT(void *handler_args, esp_event_base_t base, int32_t event_id, void *event_data)
+{
+    auto *event = static_cast<esp_mqtt_event_handle_t>(event_data);
+    mqttClient.onEventCallback(event);
+}
+#endif // // IDF CHECK
