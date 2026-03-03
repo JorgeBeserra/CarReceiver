@@ -2,6 +2,8 @@
 __pycache__/
 *.pyc
 .env/
+.vscode/
+.pio/
 venv/
 *.log
 node_modules/
@@ -14,3 +16,4 @@ dist/
 *.tar
 *.gz
 *.tgz
+

@@ -10,7 +10,7 @@ static const char* GITHUB_LATEST = "https://api.github.com/repos/JorgeBeserra/Ca
 //============================================================
 // ⚙️ Mapeamento de Hardware e Parâmetros
 //============================================================
-#define FIRMWARE_VERSION "1.0.0"
+#define FIRMWARE_VERSION "1.0.1
 
 // 🟦 Pinos
 // Controle
