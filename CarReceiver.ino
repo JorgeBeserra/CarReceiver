@@ -12,6 +12,59 @@
 #include <ArduinoJson.h>
 #include <ESPping.h>
 
+class Scheduler {
+private:
+    struct Task {
+        bool enabled;
+        unsigned long lastRun;
+        unsigned long interval;
+        std::function<void()> callback;
+        String name;
+    };
+    
+    static const int MAX_TASKS = 20;
+    Task tasks[MAX_TASKS];
+    int taskCount = 0;
+    public:
+    // Adiciona uma tarefa
+    int addTask(unsigned long interval, std::function<void()> callback, String name = "") {
+        if (taskCount >= MAX_TASKS) {
+            Serial.println("❌ Erro: Número máximo de tarefas!");
+            return -1;
+        }
+        
+        tasks[taskCount] = {true, 0, interval, callback, name};
+        if (name == "") tasks[taskCount].name = "Task_" + String(taskCount);
+        
+        taskCount++;
+        return taskCount - 1;
+    }
+    
+    // Executa as tarefas
+    void run() {
+        unsigned long currentMillis = millis();
+        
+        for (int i = 0; i < taskCount; i++) {
+            if (!tasks[i].enabled) continue;
+            
+            if (currentMillis - tasks[i].lastRun >= tasks[i].interval) {
+                tasks[i].lastRun = currentMillis;
+                tasks[i].callback();
+            }
+        }
+    }
+    
+    // Habilita/Desabilita tarefa
+    void enableTask(int taskId, bool enabled) {
+        if (taskId >= 0 && taskId < taskCount) {
+            tasks[taskId].enabled = enabled;
+        }
+    }
+};
+
+
+Scheduler scheduler;
+
 static const char* GITHUB_LATEST = "https://api.github.com/repos/JorgeBeserra/CarReceiver/releases/latest";
 
 //============================================================
@@ -1088,7 +1141,7 @@ int moveMotores(int sentidoX, int steeringY, int throttleR2) {
   left  = applyMinPwm(left);
   right = applyMinPwm(right);
 
-  //Serial.printf("rawY=%d rawX=%d thr=%d -> y=%d x=%d -> L=%d R=%d\n", -sentidoX, steeringY, throttleR2, y, x, left, right);
+  Serial.printf("rawY=%d rawX=%d thr=%d -> y=%d x=%d -> L=%d R=%d\n", -sentidoX, steeringY, throttleR2, y, x, left, right);
 
   rotateMotor(-right, -left);
   return 0;
@@ -1407,28 +1460,28 @@ void processGamepad(ControllerPtr ctl) {
     bool otaCombo = ctl->y() && ctl->l1();
 
     if (otaCombo && !otaHolding) {
-  otaHolding = true;
-  otaPressStart = millis();
-}
+      otaHolding = true;
+      otaPressStart = millis();
+    }
 
-if (otaCombo && otaHolding && (millis() - otaPressStart >= 5000)) {
-  otaHolding = false;
+    if (otaCombo && otaHolding && (millis() - otaPressStart >= 5000)) {
+      otaHolding = false;
 
-  Serial.println(F("[OTA] Triângulo+L1 5s -> checar update"));
+      Serial.println(F("[OTA] Triângulo+L1 5s -> checar update"));
 
-  // Segurança: para tudo antes
-  rotateMotor(0, 0);
-  digitalWrite(FREIO, HIGH);
-  digitalWrite(STOP, HIGH);
+      // Segurança: para tudo antes
+      rotateMotor(0, 0);
+      digitalWrite(FREIO, HIGH);
+      digitalWrite(STOP, HIGH);
 
-  otaCheckAndUpdateESP32();
+      otaCheckAndUpdateESP32();
 
-  // (se atualizar, reinicia; se não atualizar, Wi-Fi desliga dentro da função)
-}
-
-  if (!otaCombo) {
-    otaHolding = false;
+    // (se atualizar, reinicia; se não atualizar, Wi-Fi desliga dentro da função)
   }
+
+    if (!otaCombo) {
+      otaHolding = false;
+    }
 
     moveMotores( ctl->axisY() , ctl->axisRX(), ctl->throttle() );
 
@@ -1621,7 +1674,7 @@ void setup() {
 
            // Adiciona rotas para configuração MQTT
       server.on("/mqtt", HTTP_GET, []() {
-    server.send(200, "text/html", mqtt_html);
+      server.send(200, "text/html", mqtt_html);
   });
   
   server.on("/mqtt_config", HTTP_GET, []() {
