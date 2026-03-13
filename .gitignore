@@ -16,4 +16,5 @@ dist/
 *.tar
 *.gz
 *.tgz
-
+/build
+.theia
