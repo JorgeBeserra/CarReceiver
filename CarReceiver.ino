@@ -616,34 +616,46 @@ const char mqtt_html[] PROGMEM = R"rawliteral(
         });
     }
 
+    let updateAvailable = false;
+    let latestVersionFound = "";
+
     async function checkUpdate() {
       const status = document.getElementById("updateStatus");
       const btnUpdate = document.getElementById("btnDoUpdate");
+      const btnCheck = document.getElementById("btnCheckUpdate");
 
       status.innerText = "🔎 Verificando atualização...";
       btnUpdate.style.display = "none";
+      updateAvailable = false;
+      latestVersionFound = "";
 
       try {
-        const r = await fetch("/check-update");
+        const r = await fetch("/check-update?t=" + Date.now(), {
+          cache: "no-store"
+        });
+
         const data = await r.json();
 
-        if (!data.latest) {
+        if (!data.success) {
           status.innerText = "❌ Falha ao verificar versão.";
           return;
         }
 
-        if (data.update) {
-          status.innerText = "⬆️ Nova versão disponível: " + data.latest;
+        if (data.hasUpdate) {
+          updateAvailable = true;
+          latestVersionFound = data.latest || "";
+          status.innerText = "⬆️ Nova versão disponível: " + latestVersionFound;
           btnUpdate.style.display = "inline-block";
         } else {
-          status.innerText = "✅ Firmware já está atualizado (" + data.current + ")";
+          status.innerText = "✅ Firmware já está atualizado (" + (data.current || "-") + ")";
         }
 
       } catch (e) {
+        console.error(e);
         status.innerText = "❌ Erro ao verificar atualização.";
       }
     }
-
+    
     async function doUpdate() {
       const status = document.getElementById("updateStatus");
       const btnUpdate = document.getElementById("btnDoUpdate");
