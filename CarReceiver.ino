@@ -13,6 +13,8 @@
 #include "esp_ota_ops.h"
 #include "esp_heap_caps.h"
 #include "config.h"
+#include "pins.h"
+
 
 class Scheduler {
 private:
@@ -69,19 +71,7 @@ Scheduler scheduler;
 
 static const char* GITHUB_LATEST = "https://api.github.com/repos/JorgeBeserra/CarReceiver/releases/latest";
 
-//============================================================
-// ⚙️ Mapeamento de Hardware e Parâmetros
-//============================================================
-#define FIRMWARE_VERSION "1.0.4"
-
-//============================================================
-// 📡 Configuração WiFi com Portal
-//============================================================
-#define WIFI_TIMEOUT 20000          // 20 segundos para tentar conectar
-#define PORTAL_TIMEOUT 300000       // 5 minutos no portal (depois reinicia)
 String ap_ssid;
-#define AP_PASSWORD "12345678"      // Senha do portal (mínimo 8 caracteres)
-#define AP_IP "192.168.4.1"         // IP do Access Point
 
 #define MQTT_SOCKET_TIMEOUT 15  
 
@@ -104,29 +94,7 @@ Preferences preferences;
 // R2 -> Acelerador
 // L2 -> Stop tem que acender as luzes de Stop e tem que parar os motores
 
-// Pinos
-// Controle dos Motores (PONTE H)
-const int enableRightMotor = 14; // PWM pin for motor A - Marrom
-const int rightMotorPin1 = 13; // Motor esquerdo - Azul
-const int rightMotorPin2 = 12; // Vermelho
-const int leftMotorPin1 = 27;// Motor direito - Verde
-const int leftMotorPin2 = 32;// Laranja
-const int enableLeftMotor = 26;// PWM pin for motor B - Amarelo
-
-// Pinos dos Leds
-const int FAROL_BAIXO = 15;  // PWM pin for motor B
-const int FAROL_ALTO = 22;  // PWM pin for motor B
-const int RE = 2;  // PWM pin for motor B
-const int STOP = 4;  // PWM pin for motor B
-const int LANTERNA_TRASEIRA = 21;  // PWM pin for motor B
-const int SETA_DIREITA = 16;  // PWM pin for motor B
-const int SETA_ESQUERDA = 17;  // PWM pin for motor B
-
-// Parametros PWM
-const int PWMFreq = 2000;
-const int PWMResolution = 8;
-const int rightMotorPWMSpeedChannel = 4;
-const int leftMotorPWMSpeedChannel = 5;
+bool wasMoving = false;
 
 int motorDirection = 1;
 int currentSentidoMovimento = 0; // 0: Parado, -1: Ré, 1: Frente
@@ -154,9 +122,6 @@ bool lanternaTraseiraAcendido = false;
 bool reAcendido = false;
 bool piscaEsquerdo = false;
 bool piscaDireito = false;
-
-// Buzzer
-const int BUZZER_PIN = 23; 
 
 int currentHornFrequency = HORN_FREQUENCY_HIGH;
 bool isHornSweepUp = false;
@@ -1042,6 +1007,24 @@ void setControllerColorByCarMac(ControllerPtr ctl) {
   }
 }
 
+bool hasConnectedController() {
+  for (auto myController : myControllers) {
+    if (myController && myController->isConnected()) {
+      return true;
+    }
+  }
+  return false;
+}
+
+String getConnectedControllerName() {
+  for (int i = 0; i < BP32_MAX_GAMEPADS; i++) {
+    if (myControllers[i] && myControllers[i]->isConnected()) {
+      return myControllers[i]->getModelName().c_str();
+    }
+  }
+  return "";
+}
+
 void updateIdleHazardNoController() {
   bool connected = hasConnectedController();
 
@@ -1085,6 +1068,25 @@ String getConnectedControllerBatteryText() {
 
   return String(percent) + "%";
 }
+
+void loadBTState() {
+  preferences.begin("bt", true);
+  btKnown = preferences.getBool("known", false);
+  preferences.end();
+
+  Serial.printf("[BT] Estado salvo: %s\n", btKnown ? "pareado" : "sem pareamento");
+}
+
+void saveBTState(bool known) {
+  preferences.begin("bt", false);
+  preferences.putBool("known", known);
+  preferences.end();
+  btKnown = known;
+
+  Serial.printf("[BT] Estado salvo atualizado: %s\n", btKnown ? "pareado" : "sem pareamento");
+}
+
+
 
 // This callback gets called any time a new gamepad is connected.
 // Up to 4 gamepads can be connected at the same time.
@@ -1410,84 +1412,102 @@ void finalizarOTA() {
 }
 
 static void otaCheckAndUpdateESP32() {
-  
-
-  if (otaEmAndamento) {
-    Serial.println(F("[OTA] Já em andamento, ignorando nova chamada."));
-    return;
-  }
-  return false;
-}
-
-  otaEmAndamento = true;
-
-  if (!wifiConnectedForOTA()) {
-    if (!wifiOnAndConnect(15000)) {
-      wifiOff();
-      finalizarOTA();
-      return;
-    }
-  }
-
-  Serial.print(F("[OTA] Firmware atual: "));
-  Serial.println(FIRMWARE_VERSION);
-
-  testDNS("api.github.com");
-  testDNS("github.com");
-
-  String latestVersion, binUrl;
+  Serial.printf("[MEM] Heap início OTA: %u\n", ESP.getFreeHeap());
+  String latestVersion;
+  String binUrl;
   if (!githubGetLatest(latestVersion, binUrl)) {
     Serial.println(F("[OTA] Falha ao consultar GitHub."));
     return;
   }
 
-  Serial.print(F("[OTA] Última versão: "));
-  Serial.println(latestVersion.c_str());
-  Serial.print(F("[OTA] Bin: "));
-  Serial.println(binUrl.c_str());
+  delay(200);
 
-  if (!isNewerVersionESP32(String(FIRMWARE_VERSION), latestVersion)) {
-    Serial.println(F("[OTA] Já está atualizado."));
-    finalizarOTA();
+  latestVersion.trim();
+  binUrl.trim();
+
+  Serial.printf("[MEM] Heap antes update: %u\n", ESP.getFreeHeap());
+
+  WiFiClientSecure client;
+  client.setInsecure();  // só para teste
+
+  HTTPClient http;
+  http.setFollowRedirects(HTTPC_FORCE_FOLLOW_REDIRECTS);
+  http.setConnectTimeout(20000);
+  http.setTimeout(20000);
+
+  Serial.printf("[MEM] Heap antes update: %u\n", ESP.getFreeHeap());
+
+  if (http.begin(client, binUrl)) {
+  int code = http.GET();
+  int contentLength = http.getSize();
+
+  Serial.printf("HTTP final: %d\n", code);
+  Serial.printf("Location: %s\n", http.getLocation().c_str());
+  Serial.printf("Size: %d\n", contentLength);
+
+  if (code != HTTP_CODE_OK) {
+    Serial.printf("[OTA] HTTP GET falhou. code=%d erro=%s\n",
+                  code, http.errorToString(code).c_str());
+    http.end();
     return;
   }
 
-  // Segurança: para motores, apaga saídas críticas
-  rotateMotor(0,0);
+  if (contentLength <= 0) {
+    Serial.println("[OTA] Content-Length inválido.");
+    http.end();
+    return;
+  }
 
-  Serial.println(F("[OTA] Pausando Bluetooth p/ atualizar..."));
-  BP32.enableNewBluetoothConnections(false); // pelo menos impede novas conexões
-  delay(50);
-  // se não reiniciar, reabilita conexões:
- 
+  WiFiClient* stream = http.getStreamPtr();
+  if (!stream) {
+    Serial.println("[OTA] Stream nulo.");
+    http.end();
+    return;
+  }
 
-  WiFiClientSecure client;
-  client.setInsecure();
+  if (!Update.begin(UPDATE_SIZE_UNKNOWN, U_FLASH)) {
+    Serial.printf("[OTA] Update.begin falhou: %s\n", Update.errorString());
+    Serial.printf("[OTA] Update.getError(): %d\n", Update.getError());
+    http.end();
+    return;
+  }
 
-  httpUpdate.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);
+  Serial.println("[OTA] Gravando firmware...");
 
-  Serial.println(F("[OTA] Iniciando update..."));
-  t_httpUpdate_return ret = httpUpdate.update(client, binUrl);
+  uint8_t buff[1024];
+  size_t totalWritten = 0;
+  int lastProgress = -1;
 
-  switch (ret) {
-    case HTTP_UPDATE_FAILED:
-      Serial.printf("[OTA] FALHOU (%d): %s\n",
-                    httpUpdate.getLastError(),
-                    httpUpdate.getLastErrorString().c_str());
-      wifiOff();
-      BP32.enableNewBluetoothConnections(true);
-      break;
+  while (totalWritten < (size_t)contentLength) {
+    int available = stream->available();
 
-    case HTTP_UPDATE_NO_UPDATES:
-      Serial.println(F("[OTA] Sem updates."));
-      BP32.enableNewBluetoothConnections(true);
-      wifiOff();
-      break;
+    if (available > 0) {
+      int readLen = stream->read(buff, min((size_t)available, sizeof(buff)));
 
-    case HTTP_UPDATE_OK:
-      Serial.println(F("[OTA] OK! Reiniciando..."));
-      // aqui normalmente reinicia sozinho. Se não reiniciar, o Wi-Fi vai cair no reboot.
-      break;
+      if (readLen <= 0) {
+        Serial.println("[OTA] Erro lendo stream");
+        Update.abort();
+        http.end();
+        return;
+      }
+
+      if (Update.write(buff, readLen) != (size_t)readLen) {
+        Serial.printf("[OTA] Update.write falhou: %s\n", Update.errorString());
+        Update.abort();
+        http.end();
+        return;
+      }
+
+      totalWritten += readLen;
+
+      int progress = (int)((totalWritten * 100L) / contentLength);
+      if (progress > lastProgress && (progress % 5 == 0 || progress == 100)) {
+        Serial.printf("[OTA] Progresso: %d%%\n", progress);
+        lastProgress = progress;
+      }
+    }
+
+    delay(1);
   }
 
   Serial.printf("[OTA] Total gravado: %u bytes\n", totalWritten);
@@ -1519,6 +1539,7 @@ static void otaCheckAndUpdateESP32() {
 
 
 }
+
 
 void processGamepad(ControllerPtr ctl) {
     // There are different ways to query whether a button is pressed.
@@ -1656,6 +1677,8 @@ void handleBuzzer() {    unsigned long currentTime = millis();
 }
 
 
+
+
 bool loadWiFiCredentials() {
     preferences.begin("wifi", true);
     savedSSID = preferences.getString("ssid", "");
@@ -1671,12 +1694,81 @@ bool loadWiFiCredentials() {
     return false;
 }
 
+bool ctlBrakeActive() {
+  for (auto myController : myControllers) {
+    if (myController && myController->isConnected()) {
+      // Se estiver apertando L2
+      if (myController->brake() > 50) {
+        return true;
+      }
+    }
+  }
+  return false;
+}
+
+
+bool bootInOtaMode() {
+  preferences.begin("sys", false);
+  bool otaMode = preferences.getBool("ota_mode", false);
+  preferences.end();
+  return otaMode;
+}
+
+void clearOtaMode() {
+  preferences.begin("sys", false);
+  preferences.putBool("ota_mode", false);
+  preferences.end();
+}
+
 
 // Arduino setup function. Runs in CPU 1
 void setup() {
     Serial.begin(115200); 
  
     bool otaMode = bootInOtaMode();
+
+    
+    if (otaMode) {
+      Serial.printf("[BOOT] Firmware atual: v%s | modo OTA minimo\n", FIRMWARE_VERSION);
+    } else {
+      Serial.printf("[BOOT] Firmware atual: v%s | modo normal\n", FIRMWARE_VERSION);
+    }
+
+     if (otaMode) {
+      Serial.println("[OTA] Modo OTA minimo ativado");
+
+      clearOtaMode();
+
+      // conecta no Wi-Fi
+      bool hasCredentials = loadWiFiCredentials();
+      if (!hasCredentials) {
+        Serial.println("[OTA] Sem credenciais Wi-Fi");
+        return;
+      }
+
+      WiFi.mode(WIFI_STA);
+      WiFi.begin(savedSSID.c_str(), savedPassword.c_str());
+
+      unsigned long t0 = millis();
+      while (WiFi.status() != WL_CONNECTED && millis() - t0 < 20000) {
+        delay(250);
+        Serial.print(".");
+      }
+      Serial.println();
+
+      if (WiFi.status() != WL_CONNECTED) {
+        Serial.println("[OTA] Falha ao conectar Wi-Fi");
+        return;
+      }
+
+      Serial.printf("[OTA] Wi-Fi OK: %s\n", WiFi.localIP().toString().c_str());
+
+      otaCheckAndUpdateESP32();
+
+      return; // importantíssimo
+    }
+
+
 
     // Configura os pinos da ponte H
     pinMode(enableRightMotor, OUTPUT);
@@ -1877,13 +1969,7 @@ void setup() {
     delay(300);
     ESP.restart();
   });
-
-    otaRequestPending = true;
-
-    server.send(200, "text/plain", "OTA solicitado. Verifique o serial.");
     
-  });
-  
   server.begin();  // Reinicia servidor com novas rotas
   }
 
@@ -1914,6 +2000,53 @@ void updateBlinkOutputs() {
 
   digitalWrite(SETA_ESQUERDA, leftBlinkOn ? blinkState : LOW);
   digitalWrite(SETA_DIREITA, rightBlinkOn ? blinkState : LOW);
+}
+
+void updateStopPulseOnRelease() {
+  const int MOVE_DEADZONE = 40;
+
+  bool movingNow  = (abs(currentSentidoMovimento) > MOVE_DEADZONE);
+  bool stoppedNow = (abs(currentSentidoMovimento) <= MOVE_DEADZONE);
+
+  // Detecta transição: estava em movimento → parou
+  if (wasMoving && stoppedNow) {
+    stopPulseActive = true;
+    stopPulseStart = millis();
+  }
+
+  wasMoving = movingNow;
+}
+
+void updateLuzesTraseiras() {
+  bool freandoManual = ctlBrakeActive();
+  bool farolLigado = farolBaixoAcendido || farolAltoAcendido;
+
+  bool pulseFreio = false;
+  if (stopPulseActive) {
+    if (millis() - stopPulseStart < STOP_PULSE_MS) {
+      pulseFreio = true;
+    } else {
+      stopPulseActive = false;
+    }
+  }
+
+  bool freioAtivo = freandoManual || pulseFreio;
+
+  if (freioAtivo) {
+    // Freando: STOP e lanterna em 100%
+    ledcWrite(stopPWMChannel, BRILHO_MAX);
+    ledcWrite(lanternaPWMChannel, BRILHO_MAX);
+  } else {
+    // STOP apagado
+    ledcWrite(stopPWMChannel, 0);
+
+    // Lanterna acompanha o farol em brilho reduzido
+    if (farolLigado) {
+      ledcWrite(lanternaPWMChannel, BRILHO_LANTERNA);
+    } else {
+      ledcWrite(lanternaPWMChannel, 0);
+    }
+  }
 }
 
 // Arduino loop function. Runs in CPU 1.

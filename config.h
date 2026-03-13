@@ -2,7 +2,7 @@
 //============================================================
 // ⚙️ Mapeamento de Hardware e Parâmetros
 //============================================================
-#define FIRMWARE_VERSION "1.0.10"
+#define FIRMWARE_VERSION "1.0.11"
 
 #define WIFI_TIMEOUT 20000
 #define PORTAL_TIMEOUT 300000
@@ -20,6 +20,8 @@ const int lanternaPWMChannel = 7;
 const int BRILHO_MAX = 255;
 const int BRILHO_LANTERNA = 102; // 40% de 255
 
+bool stopPulseActive = false; 
+unsigned long stopPulseStart = 0;
 const unsigned long STOP_PULSE_MS = 1200;
 const uint16_t BLINK_INTERVAL_MS = 450;
 
