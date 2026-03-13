@@ -12,6 +12,7 @@
 #include <Update.h>
 #include "esp_ota_ops.h"
 #include "esp_heap_caps.h"
+#include "config.h"
 
 class Scheduler {
 private:
@@ -71,7 +72,7 @@ static const char* GITHUB_LATEST = "https://api.github.com/repos/JorgeBeserra/Ca
 //============================================================
 // ⚙️ Mapeamento de Hardware e Parâmetros
 //============================================================
-#define FIRMWARE_VERSION "1.0.9"
+#define FIRMWARE_VERSION "1.0.4"
 
 //============================================================
 // 📡 Configuração WiFi com Portal
@@ -126,17 +127,6 @@ const int PWMFreq = 2000;
 const int PWMResolution = 8;
 const int rightMotorPWMSpeedChannel = 4;
 const int leftMotorPWMSpeedChannel = 5;
-const int stopPWMChannel = 6;
-const int lanternaPWMChannel = 7;
-
-const int BRILHO_MAX = 255;
-const int BRILHO_LANTERNA = 102; // 40% de 255
-
-bool stopPulseActive = false;
-unsigned long stopPulseStart = 0;
-const unsigned long STOP_PULSE_MS = 1200;  // ajuste entre 800 e 2000
-
-bool wasMoving = false;
 
 int motorDirection = 1;
 int currentSentidoMovimento = 0; // 0: Parado, -1: Ré, 1: Frente
@@ -167,30 +157,18 @@ bool piscaDireito = false;
 
 // Buzzer
 const int BUZZER_PIN = 23; 
-const int BUZZER_CHANNEL = 0;
-const int HORN_FREQUENCY_HIGH = 400;
-const int HORN_FREQUENCY_LOW = 330;
-const int HORN_DURATION_MS = 500;
-const int HORN_SWEEP_MS = 100;
+
 int currentHornFrequency = HORN_FREQUENCY_HIGH;
 bool isHornSweepUp = false;
 uint32_t hornStartTime = 0;
 bool isHornPlaying = false;
-
-// ====== BUZINA "FON FON" (buzzer passivo) ======
-const int HORN_FON1 = 430;
-const int HORN_FON2 = 330;
-const int HORN_FON_INTERVAL_MS = 110;
-const int HORN_DUTY_ON = 160;   // volume (0..255)
-const int HORN_DUTY_OFF = 0;
-
 
 bool prevX = false;
 bool hornToggle = false;
 uint32_t lastHornToggle = 0;
 
 // ====== PISCA ======
-const uint16_t BLINK_INTERVAL_MS = 450;
+
 uint32_t lastBlinkMs = 0;
 bool blinkState = false;
 
@@ -199,6 +177,7 @@ bool leftBlinkOn = false;   // seta esquerda (L1)
 bool rightBlinkOn = false;  // seta direita (R1)
 
 bool hornOn = false;
+bool autoHazardNoController = false;
 
 bool prevTriangle = false;
 bool prevL1 = false;
@@ -207,30 +186,12 @@ bool prevR1 = false;
 bool prevB = false;
 bool farolAltoLigado = false;
 
-
-// ====== CLICK DO PISCA (rele) ======
-const int BLINK_CLICK_FREQ = 900;          // som do "tic"
-const int BLINK_CLICK_DUTY = 70;            // baixinho (0..255)
-const unsigned long BLINK_CLICK_MS = 15;    // duração do "tic"
-
 bool clickActive = false;
 unsigned long clickEndMs = 0;
 
 bool manualBlinkMode = false;   // true = L1/R1 está controlando
 
-// ===== DIRIGIBILIDADE (4x4 tank) =====
-const int AXIS_MAX = 512;
 
-// deadzones
-const int DEADZONE_THROTTLE = 40;   // 25..70
-const int DEADZONE_STEER    = 55;   // 40..90
-
-// expo: 0.0 linear / 0.6 bem suave
-const float EXPO_THROTTLE = 0.45f;
-const float EXPO_STEER    = 0.60f;
-
-// rampa (suaviza tranco)
-const int RAMP_STEP = 6;            // 4..12
 
 // trim p/ corrigir lado que puxa (ajuste fino)
 float TRIM_LEFT  = 1.00f;           // ex: 0.96
@@ -246,6 +207,9 @@ static bool otaHolding = false;
 
 char *subscribeTopic = "foo";
 char *publishTopic = "bar/bar";
+
+bool btKnown = false;                 // já houve pareamento conhecido
+bool silentHazardNoController = false; // alerta silencioso quando não há controle
 
 
 // ===== CONFIGURAÇÕES MQTT =====
@@ -617,6 +581,15 @@ const char mqtt_html[] PROGMEM = R"rawliteral(
         </div>
         <div id="updateStatus"></div>
       </div>
+
+      <div class="card">
+        <h3>🎮 Controle Bluetooth</h3>
+        <p><strong>Pareado:</strong> <span id="btPaired">-</span></p>
+        <p><strong>Conectado:</strong> <span id="btConnected">-</span></p>
+        <p><strong>Modelo:</strong> <span id="btName">-</span></p>
+        <p><strong>Bateria:</strong> <span id="btBattery">-</span></p>
+        <button class="danger" onclick="forgetBT()">🗑️ Esquecer pareamento</button>
+      </div>
       
       <div class="card">
         <h3>📡 Status MQTT</h3>
@@ -686,6 +659,11 @@ const char mqtt_html[] PROGMEM = R"rawliteral(
           document.getElementById('macInfo').textContent = status.mac || '-';
           document.getElementById('wifiInfo').textContent = status.wifi || '-';
           document.getElementById('versaoInfo').textContent = status.versao || '-';
+
+          document.getElementById('btPaired').textContent = status.bt_paired ? 'Sim' : 'Não';
+          document.getElementById('btConnected').textContent = status.bt_connected ? 'Sim' : 'Não';
+          document.getElementById('btName').textContent = status.bt_name || '-';
+          document.getElementById('btBattery').textContent = status.bt_battery || '-';
           
           document.getElementById('mqttConn').textContent = status.mqtt_connected ? 'Conectado' : 'Desconectado';
           document.getElementById('mqttConn').style.color = status.mqtt_connected ? '#4CAF50' : '#f44336';
@@ -695,96 +673,12 @@ const char mqtt_html[] PROGMEM = R"rawliteral(
           document.getElementById('farois').textContent = status.farois || '-';
           document.getElementById('setas').textContent = status.setas || '-';
           document.getElementById('movimento').textContent = status.movimento || '-';
-          
+
           if (status.last_message) {
             document.getElementById('lastMsg').textContent = status.last_message;
           }
         });
     }
-
-    let checkingUpdate = false;
-let updateAvailable = false;
-let latestVersionFound = "";
-
-async function checkUpdate() {
-  if (checkingUpdate) return;
-
-  checkingUpdate = true;
-
-  const status = document.getElementById("updateStatus");
-  const btnCheck = document.getElementById("btnCheckUpdate");
-  const btnUpdate = document.getElementById("btnDoUpdate");
-
-  status.innerHTML = "Verificando atualização...";
-  btnCheck.disabled = true;
-  btnCheck.innerText = "Checando...";
-  btnUpdate.style.display = "none";
-  updateAvailable = false;
-  latestVersionFound = "";
-
-  try {
-    const r = await fetch("/check-update?t=" + Date.now(), {
-      cache: "no-store"
-    });
-
-    const data = await r.json();
-
-    if (!data.success) {
-      status.innerHTML = "Falha ao verificar atualização.";
-      return;
-    }
-
-    if (data.hasUpdate) {
-      updateAvailable = true;
-      latestVersionFound = data.latest || "";
-      status.innerHTML = "Nova versão disponível: " + latestVersionFound;
-      btnUpdate.style.display = "inline-block";
-    } else {
-      status.innerHTML = "Firmware já está atualizado.";
-    }
-
-  } catch (e) {
-    status.innerHTML = "Erro ao verificar atualização.";
-    console.error(e);
-  } finally {
-    checkingUpdate = false;
-    btnCheck.disabled = false;
-    btnCheck.innerText = "Checar";
-  }
-}
-
-async function doUpdate() {
-  const status = document.getElementById("updateStatus");
-  const btnUpdate = document.getElementById("btnDoUpdate");
-  const btnCheck = document.getElementById("btnCheckUpdate");
-
-  if (!updateAvailable) {
-    status.innerHTML = "Nenhuma atualização disponível.";
-    return;
-  }
-
-  btnUpdate.disabled = true;
-  btnCheck.disabled = true;
-  btnUpdate.innerText = "Atualizando...";
-  status.innerHTML = "Iniciando atualização OTA... Aguarde.";
-
-  try {
-    const r = await fetch("/ota_update?t=" + Date.now(), {
-      cache: "no-store"
-    });
-
-    const txt = await r.text();
-
-    status.innerHTML = txt + " Veja o andamento no serial.";
-
-  } catch (e) {
-    status.innerHTML = "Erro ao iniciar atualização.";
-    console.error(e);
-    btnUpdate.disabled = false;
-    btnCheck.disabled = false;
-    btnUpdate.innerText = "Atualizar";
-  }
-}
 
     function saveMQTT(event) {
       event.preventDefault();
@@ -1148,6 +1042,50 @@ void setControllerColorByCarMac(ControllerPtr ctl) {
   }
 }
 
+void updateIdleHazardNoController() {
+  bool connected = hasConnectedController();
+
+  if (!connected) {
+    silentHazardNoController = true;
+
+    // só ativa o alerta automático se o usuário não ligou seta manual
+    if (!hazardOn && !leftBlinkOn && !rightBlinkOn) {
+      hazardOn = true;
+    }
+  } else {
+    if (silentHazardNoController) {
+      silentHazardNoController = false;
+
+      // desliga apenas o alerta automático
+      if (hazardOn && !manualBlinkMode) {
+        hazardOn = false;
+      }
+    }
+  }
+}
+
+int getConnectedControllerBatteryRaw() {
+  for (auto myController : myControllers) {
+    if (myController && myController->isConnected()) {
+      return myController->battery();
+    }
+  }
+  return 0;  // desconhecido
+}
+
+String getConnectedControllerBatteryText() {
+  int raw = getConnectedControllerBatteryRaw();
+
+  if (raw <= 0) {
+    return "Desconhecida";
+  }
+
+  int percent = map(raw, 1, 255, 0, 100);
+  percent = constrain(percent, 0, 100);
+
+  return String(percent) + "%";
+}
+
 // This callback gets called any time a new gamepad is connected.
 // Up to 4 gamepads can be connected at the same time.
 void onConnectedController(ControllerPtr ctl) {
@@ -1155,15 +1093,18 @@ void onConnectedController(ControllerPtr ctl) {
     for (int i = 0; i < BP32_MAX_GAMEPADS; i++) {
         if (myControllers[i] == nullptr) {
             Serial.printf("CALLBACK: Controller is connected, index=%d\n", i);
-            // Additionally, you can get certain gamepad properties like:
-            // Model, VID, PID, BTAddr, flags, etc.
+
             ControllerProperties properties = ctl->getProperties();
-            Serial.printf("Controller model: %s, VID=0x%04x, PID=0x%04x\n", ctl->getModelName().c_str(), properties.vendor_id,
-                           properties.product_id);
+            Serial.printf("Controller model: %s, VID=0x%04x, PID=0x%04x\n",
+                          ctl->getModelName().c_str(),
+                          properties.vendor_id,
+                          properties.product_id);
+
             myControllers[i] = ctl;
 
             setControllerColorByCarMac(ctl);
-            
+            saveBTState(true);
+
             foundEmptySlot = true;
             break;
         }
@@ -1287,8 +1228,8 @@ void updateHornFonFon(ControllerPtr ctl) {
 
 void updateBlinkFromSteering() {
 
-  if (hazardOn) return;
-  if (manualBlinkMode) return;   // <<< IMPORTANTE
+  if (hazardOn || silentHazardNoController) return;
+  if (manualBlinkMode) return;
 
   int x = currentSentidoDirecao;
 
@@ -1341,8 +1282,8 @@ bool githubGetLatest(String &latestVersion, String &binUrl) {
 
   Serial.printf("[MEM] Heap antes HTTP: %u\n", ESP.getFreeHeap());
 
-  if (!https.begin(client, url)) {
-    Serial.println("[OTA] Falha no https.begin()");
+  if (!https.begin(client, GITHUB_LATEST)) {
+    Serial.println(F("[OTA] https.begin() falhou"));
     return false;
   }
 
@@ -1468,111 +1409,85 @@ void finalizarOTA() {
   otaEmAndamento = false;
 }
 
-void pararMQTTParaOTA() {
-  mqtt_config.enabled = false;
-  mqttClient.setAutoReconnect(false);
-  mqtt_connected = false;
+static void otaCheckAndUpdateESP32() {
+  
 
-  Serial.println(F("[MQTT] Parado."));
+  if (otaEmAndamento) {
+    Serial.println(F("[OTA] Já em andamento, ignorando nova chamada."));
+    return;
+  }
+  return false;
 }
 
-static void otaCheckAndUpdateESP32() {
-  Serial.printf("[MEM] Heap início OTA: %u\n", ESP.getFreeHeap());
-  String latestVersion;
-  String binUrl;
+  otaEmAndamento = true;
+
+  if (!wifiConnectedForOTA()) {
+    if (!wifiOnAndConnect(15000)) {
+      wifiOff();
+      finalizarOTA();
+      return;
+    }
+  }
+
+  Serial.print(F("[OTA] Firmware atual: "));
+  Serial.println(FIRMWARE_VERSION);
+
+  testDNS("api.github.com");
+  testDNS("github.com");
+
+  String latestVersion, binUrl;
   if (!githubGetLatest(latestVersion, binUrl)) {
     Serial.println(F("[OTA] Falha ao consultar GitHub."));
     return;
   }
 
-  delay(200);
+  Serial.print(F("[OTA] Última versão: "));
+  Serial.println(latestVersion.c_str());
+  Serial.print(F("[OTA] Bin: "));
+  Serial.println(binUrl.c_str());
 
-  latestVersion.trim();
-  binUrl.trim();
+  if (!isNewerVersionESP32(String(FIRMWARE_VERSION), latestVersion)) {
+    Serial.println(F("[OTA] Já está atualizado."));
+    finalizarOTA();
+    return;
+  }
 
-  Serial.printf("[MEM] Heap antes update: %u\n", ESP.getFreeHeap());
+  // Segurança: para motores, apaga saídas críticas
+  rotateMotor(0,0);
+
+  Serial.println(F("[OTA] Pausando Bluetooth p/ atualizar..."));
+  BP32.enableNewBluetoothConnections(false); // pelo menos impede novas conexões
+  delay(50);
+  // se não reiniciar, reabilita conexões:
+ 
 
   WiFiClientSecure client;
-  client.setInsecure();  // só para teste
+  client.setInsecure();
 
-  HTTPClient http;
-  http.setFollowRedirects(HTTPC_FORCE_FOLLOW_REDIRECTS);
-  http.setConnectTimeout(20000);
-  http.setTimeout(20000);
+  httpUpdate.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);
 
-  Serial.printf("[MEM] Heap antes update: %u\n", ESP.getFreeHeap());
+  Serial.println(F("[OTA] Iniciando update..."));
+  t_httpUpdate_return ret = httpUpdate.update(client, binUrl);
 
-  if (http.begin(client, binUrl)) {
-  int code = http.GET();
-  int contentLength = http.getSize();
+  switch (ret) {
+    case HTTP_UPDATE_FAILED:
+      Serial.printf("[OTA] FALHOU (%d): %s\n",
+                    httpUpdate.getLastError(),
+                    httpUpdate.getLastErrorString().c_str());
+      wifiOff();
+      BP32.enableNewBluetoothConnections(true);
+      break;
 
-  Serial.printf("HTTP final: %d\n", code);
-  Serial.printf("Location: %s\n", http.getLocation().c_str());
-  Serial.printf("Size: %d\n", contentLength);
+    case HTTP_UPDATE_NO_UPDATES:
+      Serial.println(F("[OTA] Sem updates."));
+      BP32.enableNewBluetoothConnections(true);
+      wifiOff();
+      break;
 
-  if (code != HTTP_CODE_OK) {
-    Serial.printf("[OTA] HTTP GET falhou. code=%d erro=%s\n",
-                  code, http.errorToString(code).c_str());
-    http.end();
-    return;
-  }
-
-  if (contentLength <= 0) {
-    Serial.println("[OTA] Content-Length inválido.");
-    http.end();
-    return;
-  }
-
-  WiFiClient* stream = http.getStreamPtr();
-  if (!stream) {
-    Serial.println("[OTA] Stream nulo.");
-    http.end();
-    return;
-  }
-
-  if (!Update.begin(UPDATE_SIZE_UNKNOWN, U_FLASH)) {
-    Serial.printf("[OTA] Update.begin falhou: %s\n", Update.errorString());
-    Serial.printf("[OTA] Update.getError(): %d\n", Update.getError());
-    http.end();
-    return;
-  }
-
-  Serial.println("[OTA] Gravando firmware...");
-
-  uint8_t buff[1024];
-  size_t totalWritten = 0;
-  int lastProgress = -1;
-
-  while (totalWritten < (size_t)contentLength) {
-    int available = stream->available();
-
-    if (available > 0) {
-      int readLen = stream->read(buff, min((size_t)available, sizeof(buff)));
-
-      if (readLen <= 0) {
-        Serial.println("[OTA] Erro lendo stream");
-        Update.abort();
-        http.end();
-        return;
-      }
-
-      if (Update.write(buff, readLen) != (size_t)readLen) {
-        Serial.printf("[OTA] Update.write falhou: %s\n", Update.errorString());
-        Update.abort();
-        http.end();
-        return;
-      }
-
-      totalWritten += readLen;
-
-      int progress = (int)((totalWritten * 100L) / contentLength);
-      if (progress > lastProgress && (progress % 5 == 0 || progress == 100)) {
-        Serial.printf("[OTA] Progresso: %d%%\n", progress);
-        lastProgress = progress;
-      }
-    }
-
-    delay(1);
+    case HTTP_UPDATE_OK:
+      Serial.println(F("[OTA] OK! Reiniciando..."));
+      // aqui normalmente reinicia sozinho. Se não reiniciar, o Wi-Fi vai cair no reboot.
+      break;
   }
 
   Serial.printf("[OTA] Total gravado: %u bytes\n", totalWritten);
@@ -1757,124 +1672,11 @@ bool loadWiFiCredentials() {
 }
 
 
-void updateStopPulseOnRelease() {
-  const int MOVE_DEADZONE = 40;
-
-  bool movingNow = (abs(currentSentidoMovimento) > MOVE_DEADZONE);
-  bool stoppedNow = (abs(currentSentidoMovimento) <= MOVE_DEADZONE);
-
-  // Se estava em movimento (frente ou ré) e agora parou
-  if (wasMoving && stoppedNow) {
-    stopPulseActive = true;
-    stopPulseStart = millis();
-  }
-
-  wasMoving = movingNow;
-}
-
-void updateLuzesTraseiras() {
-  bool freandoManual = ctlBrakeActive();
-  bool farolLigado = farolBaixoAcendido || farolAltoAcendido;
-
-  bool pulseFreio = false;
-  if (stopPulseActive) {
-    if (millis() - stopPulseStart < STOP_PULSE_MS) {
-      pulseFreio = true;
-    } else {
-      stopPulseActive = false;
-    }
-  }
-
-  bool freioAtivo = freandoManual || pulseFreio;
-
-  if (freioAtivo) {
-    // Freando: STOP e lanterna em 100%
-    ledcWrite(stopPWMChannel, BRILHO_MAX);
-    ledcWrite(lanternaPWMChannel, BRILHO_MAX);
-  } else {
-    // STOP apagado
-    ledcWrite(stopPWMChannel, 0);
-
-    // Lanterna acompanha o farol em brilho reduzido
-    if (farolLigado) {
-      ledcWrite(lanternaPWMChannel, BRILHO_LANTERNA);
-    } else {
-      ledcWrite(lanternaPWMChannel, 0);
-    }
-  }
-}
-
-bool ctlBrakeActive() {
-  for (auto myController : myControllers) {
-    if (myController && myController->isConnected()) {
-      // Se estiver apertando L2
-      if (myController->brake() > 50) {
-        return true;
-      }
-    }
-  }
-  return false;
-}
-
-bool bootInOtaMode() {
-  preferences.begin("sys", false);
-  bool otaMode = preferences.getBool("ota_mode", false);
-  preferences.end();
-  return otaMode;
-}
-
-void clearOtaMode() {
-  preferences.begin("sys", false);
-  preferences.putBool("ota_mode", false);
-  preferences.end();
-}
-
-
 // Arduino setup function. Runs in CPU 1
 void setup() {
     Serial.begin(115200); 
  
     bool otaMode = bootInOtaMode();
-
-    if (otaMode) {
-      Serial.printf("[BOOT] Firmware atual: v%s | modo OTA minimo\n", FIRMWARE_VERSION);
-    } else {
-      Serial.printf("[BOOT] Firmware atual: v%s | modo normal\n", FIRMWARE_VERSION);
-    }
-
-    if (otaMode) {
-      Serial.println("[OTA] Modo OTA minimo ativado");
-
-      clearOtaMode();
-
-      // conecta no Wi-Fi
-      bool hasCredentials = loadWiFiCredentials();
-      if (!hasCredentials) {
-        Serial.println("[OTA] Sem credenciais Wi-Fi");
-        return;
-      }
-
-      WiFi.mode(WIFI_STA);
-      WiFi.begin(savedSSID.c_str(), savedPassword.c_str());
-
-      unsigned long t0 = millis();
-      while (WiFi.status() != WL_CONNECTED && millis() - t0 < 20000) {
-        delay(250);
-        Serial.print(".");
-      }
-      Serial.println();
-
-      if (WiFi.status() != WL_CONNECTED) {
-        Serial.println("[OTA] Falha ao conectar Wi-Fi");
-        return;
-      }
-
-      Serial.printf("[OTA] Wi-Fi OK: %s\n", WiFi.localIP().toString().c_str());
-
-      otaCheckAndUpdateESP32();
-
-      return; // importantíssimo
-    }
 
     // Configura os pinos da ponte H
     pinMode(enableRightMotor, OUTPUT);
@@ -1973,8 +1775,7 @@ void setup() {
 
     // Bluepad32
     Serial.printf("Firmware: %s\n", BP32.firmwareVersion());
-    BP32.setup(&onConnectedController, &onDisconnectedController);    
-    BP32.forgetBluetoothKeys();    
+    BP32.setup(&onConnectedController, &onDisconnectedController);       
     BP32.enableVirtualDevice(false);
 
     const uint8_t* addr = BP32.localBdAddress();
@@ -2046,11 +1847,21 @@ void setup() {
   });
   
   server.on("/status", HTTP_GET, []() {
+    bool btConnected = hasConnectedController();
+    String btName = getConnectedControllerName();
+    int btBatteryRaw = getConnectedControllerBatteryRaw();
+    String btBattery = getConnectedControllerBatteryText();
+
     String json = "{";
     json += "\"ip\":\"" + WiFi.localIP().toString() + "\",";
     json += "\"mac\":\"" + WiFi.macAddress() + "\",";
     json += "\"wifi\":\"" + String(WiFi.SSID()) + "\",";
     json += "\"versao\":\"" + String(FIRMWARE_VERSION) + "\",";
+    json += "\"bt_paired\":" + String(btKnown ? "true" : "false") + ",";
+    json += "\"bt_connected\":" + String(btConnected ? "true" : "false") + ",";
+    json += "\"bt_name\":\"" + btName + "\",";
+    json += "\"bt_battery_raw\":" + String(btBatteryRaw) + ",";
+    json += "\"bt_battery\":\"" + btBattery + "\",";
     json += "\"mqtt_connected\":" + String(mqtt_connected ? "true" : "false") + ",";
     json += "\"farois\":\"" + String(farolBaixoAcendido ? "Baixo" : (farolAltoAcendido ? "Alto" : "Desligado")) + "\",";
     json += "\"setas\":\"" + String(leftBlinkOn ? "Esquerda" : (rightBlinkOn ? "Direita" : "Desligado")) + "\",";
@@ -2067,32 +1878,11 @@ void setup() {
     ESP.restart();
   });
 
-  server.on("/check-update", HTTP_GET, []() {
+    otaRequestPending = true;
 
-  String latestVersion;
-  String binUrl;
-
-  bool ok = githubGetLatest(latestVersion, binUrl);
-
-  String json;
-
-  if (!ok) {
-    json = "{\"success\":false}";
-  } else {
-
-    bool hasUpdate = isNewerVersionESP32(String(FIRMWARE_VERSION), latestVersion);
-
-    json = "{";
-    json += "\"success\":true,";
-    json += "\"hasUpdate\":" + String(hasUpdate ? "true" : "false") + ",";
-    json += "\"latest\":\"" + latestVersion + "\"";
-    json += "}";
-
-  }
-
-  server.send(200, "application/json", json);
-
-});
+    server.send(200, "text/plain", "OTA solicitado. Verifique o serial.");
+    
+  });
   
   server.begin();  // Reinicia servidor com novas rotas
   }
@@ -2104,22 +1894,24 @@ void updateBlinkOutputs() {
 
   if (hazardOn || leftBlinkOn || rightBlinkOn) {
     if (now - lastBlinkMs >= BLINK_INTERVAL_MS) {
-        lastBlinkMs = now;
-        blinkState = !blinkState;
-        startBlinkClick();   // <<< TIC junto com a piscada
+      lastBlinkMs = now;
+      blinkState = !blinkState;
+
+      // só toca tic se NÃO estiver no alerta automático silencioso
+      if (!silentHazardNoController) {
+        startBlinkClick();
+      }
     }
   } else {
-    blinkState = false; // garante apagado quando não usa
+    blinkState = false;
   }
 
-  // Prioridade: alerta
   if (hazardOn) {
     digitalWrite(SETA_ESQUERDA, blinkState);
     digitalWrite(SETA_DIREITA, blinkState);
     return;
   }
 
-  // Setas individuais
   digitalWrite(SETA_ESQUERDA, leftBlinkOn ? blinkState : LOW);
   digitalWrite(SETA_DIREITA, rightBlinkOn ? blinkState : LOW);
 }
@@ -2152,6 +1944,9 @@ void loop() {
     if (dataUpdated)
         processControllers();
     
+    //autoHazardNoController = !hasConnectedController();
+    
+    updateIdleHazardNoController();
     updateBlinkFromSteering();
     updateBlinkOutputs();
     updateBlinkClick();
