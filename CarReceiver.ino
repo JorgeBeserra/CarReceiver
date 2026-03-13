@@ -616,6 +616,66 @@ const char mqtt_html[] PROGMEM = R"rawliteral(
         });
     }
 
+    async function checkUpdate() {
+      const status = document.getElementById("updateStatus");
+      const btnUpdate = document.getElementById("btnDoUpdate");
+
+      status.innerText = "🔎 Verificando atualização...";
+      btnUpdate.style.display = "none";
+
+      try {
+        const r = await fetch("/check-update");
+        const data = await r.json();
+
+        if (!data.latest) {
+          status.innerText = "❌ Falha ao verificar versão.";
+          return;
+        }
+
+        if (data.update) {
+          status.innerText = "⬆️ Nova versão disponível: " + data.latest;
+          btnUpdate.style.display = "inline-block";
+        } else {
+          status.innerText = "✅ Firmware já está atualizado (" + data.current + ")";
+        }
+
+      } catch (e) {
+        status.innerText = "❌ Erro ao verificar atualização.";
+      }
+    }
+
+    async function doUpdate() {
+      const status = document.getElementById("updateStatus");
+      const btnUpdate = document.getElementById("btnDoUpdate");
+      const btnCheck = document.getElementById("btnCheckUpdate");
+
+      if (!updateAvailable) {
+        status.innerHTML = "Nenhuma atualização disponível.";
+        return;
+      }
+
+      btnUpdate.disabled = true;
+      btnCheck.disabled = true;
+      btnUpdate.innerText = "Atualizando...";
+      status.innerHTML = "Iniciando atualização OTA... Aguarde.";
+
+      try {
+        const r = await fetch("/ota_update?t=" + Date.now(), {
+          cache: "no-store"
+        });
+
+        const txt = await r.text();
+        status.innerHTML = txt + " O carrinho pode reiniciar em instantes.";
+
+      } catch (e) {
+        status.innerHTML = "Erro ao iniciar atualização.";
+        console.error(e);
+        btnUpdate.disabled = false;
+        btnCheck.disabled = false;
+        btnUpdate.innerText = "Atualizar";
+      }
+    }
+
     function loadStatus() {
       fetch('/status')
         .then(r => r.json())
@@ -1969,6 +2029,37 @@ void setup() {
     delay(300);
     ESP.restart();
   });
+
+  server.on("/check-update", HTTP_GET, []() {
+
+  String latestVersion;
+  String binUrl;
+
+  bool ok = githubGetLatest(latestVersion, binUrl);
+
+  String json = "{";
+
+  if (!ok) {
+    json += "\"success\":false";
+  } else {
+
+    bool hasUpdate = isNewerVersionESP32(
+        String(FIRMWARE_VERSION),
+        latestVersion
+    );
+
+    json += "\"success\":true,";
+    json += "\"current\":\"" + String(FIRMWARE_VERSION) + "\",";
+    json += "\"latest\":\"" + latestVersion + "\",";
+    json += "\"hasUpdate\":" + String(hasUpdate ? "true":"false");
+  }
+
+  json += "}";
+
+  server.send(200, "application/json", json);
+});
+
+  
     
   server.begin();  // Reinicia servidor com novas rotas
   }

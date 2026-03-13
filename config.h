@@ -2,7 +2,7 @@
 //============================================================
 // ⚙️ Mapeamento de Hardware e Parâmetros
 //============================================================
-#define FIRMWARE_VERSION "1.0.11"
+#define FIRMWARE_VERSION "1.0.12"
 
 #define WIFI_TIMEOUT 20000
 #define PORTAL_TIMEOUT 300000
